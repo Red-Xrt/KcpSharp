@@ -1,0 +1,10 @@
+#if NEED_TCS_SHIM
+namespace System.Threading.Tasks
+{
+    internal class TaskCompletionSource : TaskCompletionSource<bool>
+    {
+        internal void TrySetResult() => TrySetResult(true);
+    }
+}
+
+#endif
