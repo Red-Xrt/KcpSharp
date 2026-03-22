@@ -95,6 +95,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
     private Func<Exception, KcpConversation, object?, bool>? _exceptionHandler;
     private object? _exceptionHandlerState;
+    internal Action? OnWorkAvailable;
+    private int _isProcessing;
 
     private const uint IKCP_RTO_MAX = 60000;
     private const int IKCP_THRESH_MIN = 2;
@@ -235,7 +237,99 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         _sndBufIndex = new Dictionary<uint, LinkedListNodeOfBufferItem>((int)_snd_wnd * 2);
         _rcvBufSnSet = new HashSet<uint>((int)_rcv_wnd);
 
-        RunUpdateOnActivation();
+        // Scheduler will now call ProcessPacket and Tick, so we do not run RunUpdateOnActivation.
+    }
+
+    internal void Tick()
+    {
+        if (TransportClosed) return;
+
+        var current = GetTimestamp();
+        long slap = TimeDiff(current, _ts_flush);
+        if (slap > 10000 || slap < -10000)
+        {
+            _ts_flush = current;
+            slap = 0;
+        }
+
+        if (slap >= 0 || _nodelay)
+        {
+            _ts_flush += _interval;
+            if (TimeDiff(current, _ts_flush) >= 0) _ts_flush = current + _interval;
+            var flushTask = FlushCoreAsync(CancellationToken.None);
+            if (!flushTask.IsCompletedSuccessfully)
+            {
+                _ = flushTask.AsTask();
+            }
+        }
+
+        if (_keepAliveEnabled && TimeDiff(GetTimestamp(), _lastReceiveTick) > _keepAliveGracePeriod)
+            SetTransportClosed();
+    }
+
+    internal void ProcessUpdate()
+    {
+        if (TransportClosed) return;
+
+        // Ensure only one thread processes updates for this conversation at a time
+        if (Interlocked.CompareExchange(ref _isProcessing, 1, 0) != 0) return;
+
+        try
+        {
+            var activation = _updateActivation;
+            bool anyUpdate = false;
+
+            if (activation is not null)
+            {
+                while (activation.HasPendingPackets)
+                {
+                    if (!activation.TryDequeue(out var packet, out var bufferOwner)) break;
+
+                    if (!packet.IsEmpty)
+                    {
+                        try
+                        {
+                            var rawOwner = bufferOwner as PooledPacketBuffer;
+                            anyUpdate |= SetInput(packet.Span, rawOwner);
+                        }
+                        catch (Exception ex)
+                        {
+                            new Logger("KcpServer").Error("Update error", ex);
+                        }
+                    }
+                    bufferOwner?.Dispose();
+                }
+            }
+
+            if (anyUpdate && !TransportClosed)
+            {
+                try
+                {
+                    var flushTask = UpdateCoreAsync(CancellationToken.None);
+                    if (!flushTask.IsCompletedSuccessfully)
+                    {
+                        _ = flushTask.AsTask();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    HandleFlushException(ex);
+                }
+            }
+
+            Tick();
+        }
+        finally
+        {
+            Volatile.Write(ref _isProcessing, 0);
+
+            // If a packet was enqueued right as we were finishing and releasing the lock,
+            // we should notify again to ensure it doesn't wait until the next timer tick.
+            if (_updateActivation is not null && _updateActivation.HasPendingPackets)
+            {
+                OnWorkAvailable?.Invoke();
+            }
+        }
     }
 
     /// <summary>
@@ -856,61 +950,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         return 0;
     }
 
-    private async void RunUpdateOnActivation()
-    {
-        var cancellationToken = _updateLoopCts?.Token ?? new CancellationToken(true);
-        var activation = _updateActivation;
-        if (activation is null) return;
-
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            var anyUpdate = false;
-
-            while (true)
-            {
-                using var notification = await activation.WaitAsync(CancellationToken.None).ConfigureAwait(false);
-                if (TransportClosed) return;
-
-                var packet = notification.Packet;
-                var rawOwner = notification.BufferOwner as PooledPacketBuffer;
-                
-                if (!packet.IsEmpty)
-                {
-                    try
-                    {
-                        anyUpdate |= SetInput(packet.Span, rawOwner);
-                    }
-                    catch (Exception ex)
-                    {
-                        new Logger("KcpServer").Error("Update error", ex);
-                    }
-                }
-
-                if (TransportClosed) return;
-
-                anyUpdate |= notification.TimerNotification;
-
-                if (!activation.HasPendingPackets) break;
-            }
-
-            try
-            {
-                if (anyUpdate) await UpdateCoreAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                if (!HandleFlushException(ex)) break;
-            }
-
-            if (_keepAliveEnabled && TimeDiff(GetTimestamp(), _lastReceiveTick) > _keepAliveGracePeriod)
-                SetTransportClosed();
-        }
-    }
-
     private ValueTask UpdateCoreAsync(CancellationToken cancellationToken)
     {
         var current = GetTimestamp();
@@ -993,7 +1032,9 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             return default;
         }
 
-        return activation.InputPacketAsync(packet, bufferOwner, cancellationToken);
+        var result = activation.InputPacketAsync(packet, bufferOwner, cancellationToken);
+        OnWorkAvailable?.Invoke();
+        return result;
     }
 
     private bool SetInput(ReadOnlySpan<byte> packet, PooledPacketBuffer? originalBuffer)
@@ -1509,16 +1550,27 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     public void SetTransportClosed()
     {
         TransportClosed = true;
-        Interlocked.Exchange(ref _updateActivation, null)?.Dispose();
-        var updateLoopCts = Interlocked.Exchange(ref _updateLoopCts, null);
-        if (updateLoopCts is not null)
+
+        // Ensure background processing is safely interrupted
+        int spinWait = 0;
+        while (Interlocked.CompareExchange(ref _isProcessing, 1, 0) != 0)
         {
-            updateLoopCts.Cancel();
-            updateLoopCts.Dispose();
+            if (spinWait++ > 100) Thread.Sleep(1);
+            else Thread.SpinWait(10);
         }
 
-        _sendQueue.SetTransportClosed();
-        _receiveQueue.SetTransportClosed();
+        try
+        {
+            Interlocked.Exchange(ref _updateActivation, null)?.Dispose();
+            var updateLoopCts = Interlocked.Exchange(ref _updateLoopCts, null);
+            if (updateLoopCts is not null)
+            {
+                updateLoopCts.Cancel();
+                updateLoopCts.Dispose();
+            }
+
+            _sendQueue.SetTransportClosed();
+            _receiveQueue.SetTransportClosed();
 
         // Fix BUG-C1: Collect nodes first under _sndBuf lock to prevent deadlock with FlushCoreAsync
         var sndNodesToRelease = new System.Collections.Generic.List<LinkedListNode<KcpSendReceiveBufferItem>>();
@@ -1567,6 +1619,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
 
         _queueItemCache.Clear();
+        }
+        finally
+        {
+            Volatile.Write(ref _isProcessing, 0);
+        }
     }
 
     /// <inheritdoc />

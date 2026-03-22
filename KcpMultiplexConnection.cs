@@ -247,6 +247,12 @@ public sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTranspor
                 _disposeAction.Invoke(value.State);
             ThrowObjectDisposedException();
         }
+
+        // Hook up the scheduler if this is a multiplexed socket transport
+        if (_transport is KcpSocketTransport<KcpMultiplexConnection<T>> multiplexTransport && conversation is KcpConversation kcpConv)
+        {
+            multiplexTransport.ScheduleConversation(kcpConv);
+        }
     }
 
     /// <summary>

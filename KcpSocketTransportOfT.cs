@@ -13,13 +13,16 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 {
     private readonly int _mtu;
     private readonly int _receiveBufferPoolSize;
-    private readonly UdpClient _udpListener;
+    private readonly Socket _socket;
     private static readonly Logger Logger = new("KcpServer");
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> UdpDebugCounters =
         new(System.StringComparer.Ordinal);
     private T? _connection;
     private CancellationTokenSource? _cts;
-    private bool _disposed;
+    private volatile bool _disposed;
+    private volatile bool _stopped;
+    private Thread? _receiveThread;
+    private KcpScheduler? _scheduler;
 
     private readonly byte[][] _batchBuffers;
     private readonly IPEndPoint?[] _batchEndpoints;
@@ -35,7 +38,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     /// <param name="receiveBufferPoolSize">The size of the pool to allocate receive buffers.</param>
     protected KcpSocketTransport(UdpClient listener, int mtu, int receiveBufferPoolSize = 8)
     {
-        _udpListener = listener ?? throw new ArgumentNullException(nameof(listener));
+        if (listener == null) throw new ArgumentNullException(nameof(listener));
+        _socket = listener.Client;
         _mtu = mtu;
         _receiveBufferPoolSize = receiveBufferPoolSize;
         if (mtu < 50) throw new ArgumentOutOfRangeException(nameof(mtu));
@@ -79,7 +83,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     {
         try
         {
-            await _udpListener.Client
+            await _socket
                 .SendToAsync(packet, SocketFlags.None, endpoint, cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -135,7 +139,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         
         try
         {
-            await _udpListener.Client
+            await _socket
                 .SendMessagesAsync(datagrams, SocketFlags.None, cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -145,7 +149,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         {
             try
             {
-                await _udpListener.Client
+                await _socket
                     .SendToAsync(_batchBuffers[i].AsMemory(0, _batchSizes[i]),
                                  SocketFlags.None,
                                  _batchEndpoints[i]!,
@@ -197,10 +201,35 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         _connection = Activate();
         if (_connection is null) throw new InvalidOperationException();
 
-        TuneSocket(_udpListener.Client);
+        TuneSocket(_socket);
+
+        _scheduler = new KcpScheduler(workerThreadCount: 2); // default 2 workers
+        if (_connection is KcpConversation kcpConv)
+        {
+            kcpConv.OnWorkAvailable = () => _scheduler.EnqueueWork(kcpConv);
+            _scheduler.ScheduleTimer(kcpConv, 100);
+        }
 
         _cts = new CancellationTokenSource();
-        RunReceiveLoop();
+        _stopped = false;
+
+        var port = ((IPEndPoint?)_socket.LocalEndPoint)?.Port ?? 0;
+        _receiveThread = new Thread(RunReceiveLoopSync)
+        {
+            IsBackground = true,
+            Name = $"KcpRecv-{port}",
+            Priority = ThreadPriority.AboveNormal
+        };
+        _receiveThread.Start();
+    }
+
+    internal void ScheduleConversation(KcpConversation conversation)
+    {
+        if (_scheduler != null && !_disposed)
+        {
+            conversation.OnWorkAvailable = () => _scheduler.EnqueueWork(conversation);
+            _scheduler.ScheduleTimer(conversation, 100);
+        }
     }
 
     private void TuneSocket(Socket socket)
@@ -221,24 +250,41 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
     }
 
-    private async void RunReceiveLoop()
+    private void RunReceiveLoopSync()
     {
-        var cancellationToken = _cts?.Token ?? new CancellationToken(true);
         IKcpConversation? connection = _connection;
-        if (connection is null || cancellationToken.IsCancellationRequested) return;
+        if (connection is null || _stopped) return;
 
         var pool = new PacketBufferPool(_receiveBufferPoolSize, _mtu);
-        var remoteEndpoint = new IPEndPoint(_udpListener.Client.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? IPAddress.Any : IPAddress.IPv6Any, 0);
+        var remoteEndpoint = new IPEndPoint(_socket.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? IPAddress.Any : IPAddress.IPv6Any, 0);
+        var reusableSocketAddress = remoteEndpoint.Serialize();
+
+        var cancellationToken = _cts?.Token ?? CancellationToken.None;
+
         try
         {
-            while (!cancellationToken.IsCancellationRequested)
+            while (!_stopped && !cancellationToken.IsCancellationRequested)
             {
-                var bufferOwner = await pool.RentAsync(cancellationToken).ConfigureAwait(false);
+                var bufferOwnerTask = pool.RentAsync(cancellationToken);
+                var bufferOwner = bufferOwnerTask.IsCompletedSuccessfully
+                    ? bufferOwnerTask.Result
+                    : bufferOwnerTask.AsTask().GetAwaiter().GetResult();
+
                 var bytesReceived = 0;
                 IPEndPoint? endpoint = null;
                 try
                 {
-                    var receiveResult = await _udpListener.Client.ReceiveFromAsync(bufferOwner.Memory, System.Net.Sockets.SocketFlags.None, remoteEndpoint, cancellationToken).ConfigureAwait(false);
+                    var receiveTask = _socket.ReceiveMessageFromAsync(bufferOwner.Memory, System.Net.Sockets.SocketFlags.None, remoteEndpoint, cancellationToken);
+                    SocketReceiveMessageFromResult receiveResult;
+                    if (receiveTask.IsCompletedSuccessfully)
+                    {
+                        receiveResult = receiveTask.Result;
+                    }
+                    else
+                    {
+                        receiveResult = receiveTask.AsTask().GetAwaiter().GetResult();
+                    }
+
                     bytesReceived = receiveResult.ReceivedBytes;
                     endpoint = (IPEndPoint)receiveResult.RemoteEndPoint;
                 }
@@ -276,7 +322,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                     {
                         if (ShouldShowHandshakeLog() && bytesReceived <= 96)
                         {
-                            var key = endpoint.ToString();
+                            var key = endpoint?.ToString() ?? "unknown";
                             var count = UdpDebugCounters.AddOrUpdate(key, 1, static (_, c) => c + 1);
                             if (count <= 10)
                             {
@@ -291,13 +337,18 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                         // ignore logging errors
                     }
 
-                    if (OnRawPacketReceived(packet, endpoint) || connection is not IKcpPacketSink sink)
+                    if (endpoint is null || OnRawPacketReceived(packet, endpoint) || connection is not IKcpPacketSink sink)
                     {
                         bufferOwner.Dispose();
                         continue;
                     }
 
-                    await sink.InputPacketAsync(packet, endpoint, bufferOwner, cancellationToken).ConfigureAwait(false);
+                    var inputTask = sink.InputPacketAsync(packet, endpoint, bufferOwner, CancellationToken.None);
+                    if (!inputTask.IsCompletedSuccessfully)
+                    {
+                        inputTask.AsTask().GetAwaiter().GetResult();
+                    }
+
                 }
                 else
                 {
@@ -347,21 +398,40 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     {
         if (!_disposed)
         {
+            _stopped = true;
+            _disposed = true;
+
             if (disposing)
             {
                 var cts = Interlocked.Exchange(ref _cts, null);
                 if (cts is not null)
                 {
-                    cts.Cancel();
+                    try { cts.Cancel(); } catch { }
                     cts.Dispose();
                 }
 
+                try
+                {
+                    // Forcefully unblock any active socket operations
+                    _socket.Dispose();
+                }
+                catch { }
+
                 _connection?.Dispose();
+
+                var thread = _receiveThread;
+                if (thread != null && thread.IsAlive && Thread.CurrentThread != thread)
+                {
+                    thread.Join(100);
+                }
+
+                _scheduler?.Dispose();
             }
 
             _connection = null;
             _cts = null;
-            _disposed = true;
+            _receiveThread = null;
+            _scheduler = null;
         }
     }
 
