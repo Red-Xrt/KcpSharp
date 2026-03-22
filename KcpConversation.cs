@@ -95,6 +95,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
     private Func<Exception, KcpConversation, object?, bool>? _exceptionHandler;
     private object? _exceptionHandlerState;
+    internal Action? OnWorkAvailable;
+    private int _isProcessing;
 
     private const uint IKCP_RTO_MAX = 60000;
     private const int IKCP_THRESH_MIN = 2;
@@ -195,6 +197,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         StreamMode = options is not null && options.StreamMode;
 
         _updateActivation = new KcpConversationUpdateActivation((int)_interval);
+        _updateActivation.OnActivated = () => OnWorkAvailable?.Invoke();
+
         _queueItemCache = new KcpSendReceiveQueueItemCache();
         _sendQueue = new KcpSendQueue(_bufferPool, _updateActivation, StreamMode,
             options is null || options.SendQueueSize <= 0
@@ -235,7 +239,127 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         _sndBufIndex = new Dictionary<uint, LinkedListNodeOfBufferItem>((int)_snd_wnd * 2);
         _rcvBufSnSet = new HashSet<uint>((int)_rcv_wnd);
 
-        RunUpdateOnActivation();
+        // Pre-size pools according to Phase 7
+        _sndCache.PreAllocate((int)_snd_wnd * 2);
+        _rcvCache.PreAllocate((int)_rcv_wnd * 2);
+
+        // Scheduler will now call ProcessPacket and Tick, so we do not run RunUpdateOnActivation.
+    }
+
+    private volatile int _flushPending;
+
+    internal void ProcessUpdate()
+    {
+        if (TransportClosed)
+        {
+            DoCleanup();
+            return;
+        }
+
+        int currentThreadId = Environment.CurrentManagedThreadId;
+        if (Interlocked.CompareExchange(ref _isProcessing, currentThreadId, 0) != 0) return;
+
+        bool isAsync = false;
+        try
+        {
+            var activation = _updateActivation;
+            bool anyUpdate = false;
+
+            if (activation is not null)
+            {
+                while (activation.HasPendingPackets)
+                {
+                    if (!activation.TryDequeue(out var packet, out var bufferOwner)) break;
+
+                    if (!packet.IsEmpty)
+                    {
+                        try
+                        {
+                            var rawOwner = bufferOwner as PooledPacketBuffer;
+                            anyUpdate |= SetInput(packet.Span, rawOwner);
+                        }
+                        catch (Exception ex)
+                        {
+                            new Logger("KcpServer").Error("Update error", ex);
+                        }
+                    }
+                    bufferOwner?.Dispose();
+                }
+            }
+
+            var current = GetTimestamp();
+            long slap = TimeDiff(current, _ts_flush);
+            if (slap > 10000 || slap < -10000)
+            {
+                _ts_flush = current;
+                slap = 0;
+            }
+
+            if ((anyUpdate || slap >= 0 || _nodelay) && !TransportClosed)
+            {
+                if (Interlocked.CompareExchange(ref _flushPending, 1, 0) == 0)
+                {
+                    try
+                    {
+                        if (slap >= 0 || _nodelay)
+                        {
+                            _ts_flush += _interval;
+                            if (TimeDiff(current, _ts_flush) >= 0) _ts_flush = current + _interval;
+                        }
+
+                        var flushTask = FlushCoreAsync(CancellationToken.None);
+                        if (!flushTask.IsCompletedSuccessfully)
+                        {
+                            isAsync = true;
+                            flushTask.AsTask().ContinueWith(_ =>
+                            {
+                                try
+                                {
+                                    if (TransportClosed) DoCleanup();
+                                    else if (_updateActivation?.HasPendingPackets == true) OnWorkAvailable?.Invoke();
+                                }
+                                finally
+                                {
+                                    Volatile.Write(ref _flushPending, 0);
+                                    Volatile.Write(ref _isProcessing, 0);
+                                }
+                            });
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        HandleFlushException(ex);
+                    }
+                    finally
+                    {
+                        if (!isAsync)
+                        {
+                            Volatile.Write(ref _flushPending, 0);
+                        }
+                    }
+                }
+            }
+
+            if (_keepAliveEnabled && TimeDiff(GetTimestamp(), _lastReceiveTick) > _keepAliveGracePeriod)
+            {
+                SetTransportClosed();
+            }
+        }
+        finally
+        {
+            if (!isAsync)
+            {
+                Volatile.Write(ref _isProcessing, 0);
+                if (TransportClosed)
+                {
+                    DoCleanup();
+                }
+                else if (_updateActivation?.HasPendingPackets == true)
+                {
+                    OnWorkAvailable?.Invoke();
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -448,7 +572,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         return _sendQueue.FlushForStreamAsync(cancellationToken);
     }
 
-    private async ValueTask SendOrBatch(
+    private ValueTask SendOrBatch(
         Memory<byte> buffer, int size, int postBufferSize,
         IKcpBatchTransport? batch, CancellationToken cancellationToken)
     {
@@ -460,18 +584,27 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             {
                 packet.CopyTo(slice);
                 batch.CommitBatchSlot(slot, packet.Length, _remoteEndPoint);
-                return;
+                return default;
             }
-            // Batch is full or packet is too large for batch slot. Flush existing batched packets first to preserve strict ordering.
-            await batch.FlushBatchAsync(cancellationToken).ConfigureAwait(false);
             
-            // Try again after flush
-            if (batch.TryGetBatchSlice(packet.Length, out slice, out slot))
-            {
-                packet.CopyTo(slice);
-                batch.CommitBatchSlot(slot, packet.Length, _remoteEndPoint);
-                return;
-            }
+            return FlushBatchAndSendAsync(batch, packet, cancellationToken);
+        }
+
+        return _transport.SendPacketAsync(packet, _remoteEndPoint, cancellationToken);
+    }
+
+    private async ValueTask FlushBatchAndSendAsync(
+        IKcpBatchTransport batch, Memory<byte> packet, CancellationToken cancellationToken)
+    {
+        // Batch is full or packet is too large for batch slot. Flush existing batched packets first to preserve strict ordering.
+        await batch.FlushBatchAsync(cancellationToken).ConfigureAwait(false);
+
+        // Try again after flush
+        if (batch.TryGetBatchSlice(packet.Length, out var slice, out int slot))
+        {
+            packet.CopyTo(slice);
+            batch.CommitBatchSlot(slot, packet.Length, _remoteEndPoint);
+            return;
         }
         
         // Either batch is null, or packet size > _mtu (TryGetBatchSlice returns false even when empty).
@@ -482,10 +615,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     }
 
 #if !NET6_0_OR_GREATER
-        private ValueTask FlushCoreAsync(CancellationToken cancellationToken)
-            => new ValueTask(FlushCore2Async(cancellationToken));
+    private ValueTask FlushCoreAsync(CancellationToken cancellationToken)
+        => new ValueTask(FlushCore2Async(cancellationToken));
 
-        private async Task FlushCore2Async(CancellationToken cancellationToken)
+    private async Task FlushCore2Async(CancellationToken cancellationToken)
 #else
     private ValueTask FlushCoreAsync(CancellationToken cancellationToken)
     {
@@ -856,80 +989,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         return 0;
     }
 
-    private async void RunUpdateOnActivation()
-    {
-        var cancellationToken = _updateLoopCts?.Token ?? new CancellationToken(true);
-        var activation = _updateActivation;
-        if (activation is null) return;
-
-        while (!cancellationToken.IsCancellationRequested)
-        {
-            var anyUpdate = false;
-
-            while (true)
-            {
-                using var notification = await activation.WaitAsync(CancellationToken.None).ConfigureAwait(false);
-                if (TransportClosed) return;
-
-                var packet = notification.Packet;
-                var rawOwner = notification.BufferOwner as PooledPacketBuffer;
-                
-                if (!packet.IsEmpty)
-                {
-                    try
-                    {
-                        anyUpdate |= SetInput(packet.Span, rawOwner);
-                    }
-                    catch (Exception ex)
-                    {
-                        new Logger("KcpServer").Error("Update error", ex);
-                    }
-                }
-
-                if (TransportClosed) return;
-
-                anyUpdate |= notification.TimerNotification;
-
-                if (!activation.HasPendingPackets) break;
-            }
-
-            try
-            {
-                if (anyUpdate) await UpdateCoreAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                if (!HandleFlushException(ex)) break;
-            }
-
-            if (_keepAliveEnabled && TimeDiff(GetTimestamp(), _lastReceiveTick) > _keepAliveGracePeriod)
-                SetTransportClosed();
-        }
-    }
-
-    private ValueTask UpdateCoreAsync(CancellationToken cancellationToken)
-    {
-        var current = GetTimestamp();
-        long slap = TimeDiff(current, _ts_flush);
-        if (slap > 10000 || slap < -10000)
-        {
-            _ts_flush = current;
-            slap = 0;
-        }
-
-        if (slap >= 0 || _nodelay)
-        {
-            _ts_flush += _interval;
-            if (TimeDiff(current, _ts_flush) >= 0) _ts_flush = current + _interval;
-            return FlushCoreAsync(cancellationToken);
-        }
-
-        return default;
-    }
 
     private bool HandleFlushException(Exception ex)
     {
@@ -993,7 +1052,9 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             return default;
         }
 
-        return activation.InputPacketAsync(packet, bufferOwner, cancellationToken);
+        var result = activation.InputPacketAsync(packet, bufferOwner, cancellationToken);
+        OnWorkAvailable?.Invoke();
+        return result;
     }
 
     private bool SetInput(ReadOnlySpan<byte> packet, PooledPacketBuffer? originalBuffer)
@@ -1509,6 +1570,20 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     public void SetTransportClosed()
     {
         TransportClosed = true;
+
+        if (Interlocked.CompareExchange(ref _isProcessing, -1, 0) == 0)
+        {
+            DoCleanup();
+            Volatile.Write(ref _isProcessing, 0);
+        }
+    }
+
+    private int _cleanupDone;
+
+    private void DoCleanup()
+    {
+        if (Interlocked.CompareExchange(ref _cleanupDone, 1, 0) != 0) return;
+
         Interlocked.Exchange(ref _updateActivation, null)?.Dispose();
         var updateLoopCts = Interlocked.Exchange(ref _updateLoopCts, null);
         if (updateLoopCts is not null)
@@ -1536,12 +1611,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         foreach (var node in sndNodesToRelease)
         {
-            // Note: _sndBuf.Clear() was called above, so these nodes are no longer in the list.
-            // FlushCoreAsync iterates over _sndBuf with a lock on each node.
-            // There is a small window between _sndBuf.Clear() and this lock where
-            // FlushCoreAsync might have obtained a reference to a node and is waiting on its lock.
-            // This is intentional: locking here serializes access to the node's data release,
-            // preventing the buffer from being released while FlushCoreAsync is processing it.
             lock (node)
             {
                 var data = node.ValueRef.Data;
