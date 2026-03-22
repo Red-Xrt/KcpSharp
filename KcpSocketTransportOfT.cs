@@ -28,7 +28,11 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     private readonly IPEndPoint?[] _batchEndpoints;
     private readonly int[] _batchSizes;
     private int _batchCount;
-    private const int MaxBatchSize = 16;
+    private const int MaxBatchSize = 32;
+
+    private int _packetsSentLastSecond;
+    private long _lastBatchTick;
+    private int _effectiveBatchSize = 16;
 
     /// <summary>
     ///     Construct a socket transport with the specified socket and remote endpoint.
@@ -81,6 +85,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     private ValueTask SendCoreAsync(Memory<byte> packet, IPEndPoint endpoint,
         CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _packetsSentLastSecond);
         try
         {
             var task = _socket.SendToAsync(packet, SocketFlags.None, endpoint, cancellationToken);
@@ -96,12 +101,22 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         }
     }
 
-    int IKcpBatchTransport.BatchCapacity => MaxBatchSize - _batchCount;
+    int IKcpBatchTransport.BatchCapacity => _effectiveBatchSize - _batchCount;
 
     bool IKcpBatchTransport.TryGetBatchSlice(int requiredSize, out Memory<byte> slice, out int slotIndex)
     {
+        long currentTick = Environment.TickCount64;
+        if (currentTick - _lastBatchTick >= 1000)
+        {
+            _lastBatchTick = currentTick;
+            int sent = Interlocked.Exchange(ref _packetsSentLastSecond, 0);
+            if (sent < 50) _effectiveBatchSize = 8;
+            else if (sent > 500) _effectiveBatchSize = 32;
+            else _effectiveBatchSize = 16;
+        }
+
 #if NET8_0_OR_GREATER && HAS_SENDMESSAGESASYNC
-        if (_batchCount >= MaxBatchSize || requiredSize > _mtu)
+        if (_batchCount >= _effectiveBatchSize || requiredSize > _mtu)
         {
             slice = default;
             slotIndex = -1;
@@ -144,6 +159,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         }
         
         _batchCount = 0;
+        Interlocked.Increment(ref _packetsSentLastSecond);
         try
         {
             var task = _socket.SendMessagesAsync(datagrams, SocketFlags.None, cancellationToken);

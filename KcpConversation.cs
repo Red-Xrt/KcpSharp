@@ -197,7 +197,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         StreamMode = options is not null && options.StreamMode;
 
         _updateActivation = new KcpConversationUpdateActivation((int)_interval);
-        _updateActivation.OnNotify = () => OnWorkAvailable?.Invoke();
+        _updateActivation.OnActivated = () => OnWorkAvailable?.Invoke();
 
         _queueItemCache = new KcpSendReceiveQueueItemCache();
         _sendQueue = new KcpSendQueue(_bufferPool, _updateActivation, StreamMode,
