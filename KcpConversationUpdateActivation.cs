@@ -6,7 +6,7 @@ namespace HyacineCore.Server.Kcp.KcpSharp;
 
 internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConversationUpdateNotification>, IDisposable
 {
-    private readonly Timer _timer;
+    private readonly Timer? _timer;
 
     private readonly WaitList _waitList;
     private bool _activeWait;
@@ -22,13 +22,21 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
 
     internal object SyncRoot => _syncRoot;
 
-    public KcpConversationUpdateActivation(int interval)
+    public KcpConversationUpdateActivation(int interval, bool useTimer = false)
     {
-        _timer = new Timer(state =>
+        if (useTimer)
         {
-            var target = (KcpConversationUpdateActivation)state!;
-            target.Notify();
-        }, this, interval, interval);
+            _timer = new Timer(state =>
+            {
+                var target = (KcpConversationUpdateActivation)state!;
+                target.Notify();
+            }, this, interval, interval);
+        }
+        else
+        {
+            _timer = null;
+        }
+
         _mrvtsc = new ManualResetValueTaskSourceCore<KcpConversationUpdateNotification>
             { RunContinuationsAsynchronously = false };
         _waitList = new WaitList(this);
@@ -59,7 +67,7 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
             }
         }
 
-        _timer.Dispose();
+        _timer?.Dispose();
         _waitList.Dispose();
     }
 

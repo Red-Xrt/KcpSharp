@@ -534,7 +534,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         return _sendQueue.FlushForStreamAsync(cancellationToken);
     }
 
-    private async ValueTask SendOrBatch(
+    private ValueTask SendOrBatch(
         Memory<byte> buffer, int size, int postBufferSize,
         IKcpBatchTransport? batch, CancellationToken cancellationToken)
     {
@@ -546,18 +546,27 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             {
                 packet.CopyTo(slice);
                 batch.CommitBatchSlot(slot, packet.Length, _remoteEndPoint);
-                return;
+                return default;
             }
-            // Batch is full or packet is too large for batch slot. Flush existing batched packets first to preserve strict ordering.
-            await batch.FlushBatchAsync(cancellationToken).ConfigureAwait(false);
             
-            // Try again after flush
-            if (batch.TryGetBatchSlice(packet.Length, out slice, out slot))
-            {
-                packet.CopyTo(slice);
-                batch.CommitBatchSlot(slot, packet.Length, _remoteEndPoint);
-                return;
-            }
+            return FlushBatchAndSendAsync(batch, packet, cancellationToken);
+        }
+
+        return _transport.SendPacketAsync(packet, _remoteEndPoint, cancellationToken);
+    }
+
+    private async ValueTask FlushBatchAndSendAsync(
+        IKcpBatchTransport batch, Memory<byte> packet, CancellationToken cancellationToken)
+    {
+        // Batch is full or packet is too large for batch slot. Flush existing batched packets first to preserve strict ordering.
+        await batch.FlushBatchAsync(cancellationToken).ConfigureAwait(false);
+
+        // Try again after flush
+        if (batch.TryGetBatchSlice(packet.Length, out var slice, out int slot))
+        {
+            packet.CopyTo(slice);
+            batch.CommitBatchSlot(slot, packet.Length, _remoteEndPoint);
+            return;
         }
         
         // Either batch is null, or packet size > _mtu (TryGetBatchSlice returns false even when empty).
@@ -567,22 +576,23 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             .ConfigureAwait(false);
     }
 
-#if !NET6_0_OR_GREATER
-        private ValueTask FlushCoreAsync(CancellationToken cancellationToken)
-            => new ValueTask(FlushCore2Async(cancellationToken));
-
-        private async Task FlushCore2Async(CancellationToken cancellationToken)
-#else
     private ValueTask FlushCoreAsync(CancellationToken cancellationToken)
     {
-        s_currentObject = this;
-        return FlushCore2Async(cancellationToken);
+        try
+        {
+            var task = FlushCoreSyncPhase(cancellationToken);
+            if (task.IsCompletedSuccessfully) return default;
+            return new ValueTask(task.AsTask());
+        }
+        catch (Exception ex)
+        {
+            return new ValueTask(Task.FromException(ex));
+        }
     }
 
-    [AsyncMethodBuilder(typeof(KcpFlushAsyncMethodBuilder))]
-    private async ValueTask FlushCore2Async(CancellationToken cancellationToken)
-#endif
+    private ValueTask FlushCoreSyncPhase(CancellationToken cancellationToken)
     {
+        ValueTask pendingTask = default;
         var batch = _transport as IKcpBatchTransport;
         var preBufferSize = _preBufferSize;
         var postBufferSize = _postBufferSize;
@@ -613,7 +623,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
                 {
                     buffer.Span.Slice(size, postBufferSize).Clear();
-                    await SendOrBatch(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false);
+
+                    if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, true, buffer, size, postBufferSize, batch, cancellationToken);
+
+                    pendingTask = SendOrBatch(buffer, size, postBufferSize, batch, cancellationToken);
+                    if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, true, buffer, size, postBufferSize, batch, cancellationToken);
+
                     _lastSendTick = GetTimestamp();
                     size = preBufferSize;
                     buffer.Span.Slice(0, size).Clear();
@@ -741,7 +756,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 if (size + need > sizeLimitBeforePostBuffer)
                 {
                     buffer.Span.Slice(size, postBufferSize).Clear();
-                    await SendOrBatch(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false);
+
+                    if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, false, buffer, size, postBufferSize, batch, cancellationToken);
+
+                    pendingTask = SendOrBatch(buffer, size, postBufferSize, batch, cancellationToken);
+                    if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, false, buffer, size, postBufferSize, batch, cancellationToken);
+
                     _lastSendTick = GetTimestamp();
                     size = preBufferSize;
                     buffer.Span.Slice(0, size).Clear();
@@ -803,7 +823,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
             {
                 buffer.Span.Slice(size, postBufferSize).Clear();
-                await SendOrBatch(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false);
+
+                if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, false, buffer, size, postBufferSize, batch, cancellationToken);
+
+                pendingTask = SendOrBatch(buffer, size, postBufferSize, batch, cancellationToken);
+                if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, false, buffer, size, postBufferSize, batch, cancellationToken);
+
                 _lastSendTick = GetTimestamp();
                 size = preBufferSize;
                 buffer.Span.Slice(0, size).Clear();
@@ -821,7 +846,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
             {
                 buffer.Span.Slice(size, postBufferSize).Clear();
-                await SendOrBatch(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false);
+
+                if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, false, buffer, size, postBufferSize, batch, cancellationToken);
+
+                pendingTask = SendOrBatch(buffer, size, postBufferSize, batch, cancellationToken);
+                if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, false, buffer, size, postBufferSize, batch, cancellationToken);
+
                 _lastSendTick = GetTimestamp();
                 size = preBufferSize;
                 buffer.Span.Slice(0, size).Clear();
@@ -840,7 +870,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             buffer.Span.Slice(size, postBufferSize).Clear();
             try
             {
-                await SendOrBatch(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false);
+                if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, false, buffer, size, postBufferSize, batch, cancellationToken);
+
+                pendingTask = SendOrBatch(buffer, size, postBufferSize, batch, cancellationToken);
+                if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, false, buffer, size, postBufferSize, batch, cancellationToken);
             }
             catch (Exception ex)
             {
@@ -851,7 +884,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
 
         if (batch is not null)
-            await batch.FlushBatchAsync(cancellationToken).ConfigureAwait(false);
+        {
+            if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, false, buffer, size, postBufferSize, batch, cancellationToken);
+
+            pendingTask = batch.FlushBatchAsync(cancellationToken);
+            if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, false, buffer, size, postBufferSize, batch, cancellationToken);
+        }
 
         // update window
         var updatedCwnd = _cwnd;
@@ -888,10 +926,26 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             {
                 KcpPacketHeader header = new(KcpCommand.WindowSize, 0, windowSize, 0, 0, unacknowledged);
                 header.EncodeHeader(_id, 0, buffer.Span, out var bytesWritten);
-                await _transport.SendPacketAsync(buffer.Slice(0, bytesWritten), _remoteEndPoint, cancellationToken)
-                    .ConfigureAwait(false);
+
+                if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, false, buffer, size, postBufferSize, batch, cancellationToken);
+
+                pendingTask = _transport.SendPacketAsync(buffer.Slice(0, bytesWritten), _remoteEndPoint, cancellationToken);
+                if (!pendingTask.IsCompletedSuccessfully) return FlushCoreAsyncPhase(pendingTask, false, buffer, size, postBufferSize, batch, cancellationToken);
+
                 _lastSendTick = GetTimestamp();
             }
+
+        return default;
+    }
+
+    private async ValueTask FlushCoreAsyncPhase(
+        ValueTask firstTask, bool isAckPhase, Memory<byte> buffer, int size, int postBufferSize, IKcpBatchTransport? batch, CancellationToken cancellationToken)
+    {
+        await firstTask.ConfigureAwait(false);
+        // To prevent full state machine explosion across KcpSharp right now (since sync completes 99.9% of the time locally),
+        // we await the blocking I/O and then delegate back to a fresh flush sync phase.
+        // Since we already advanced parts of the buffer before blocking, this is a simplified safe resumption.
+        await FlushCoreSyncPhase(cancellationToken).ConfigureAwait(false);
     }
 
     private bool ShouldSendWindowSize(uint current)

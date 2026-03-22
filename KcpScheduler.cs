@@ -17,6 +17,9 @@ internal sealed class KcpScheduler : IDisposable
     private readonly int _wheelSize = 512;
     private volatile uint _currentTick;
 
+    // Track active conversations to prevent ghost entries and ensure clean un-scheduling
+    private readonly ConcurrentDictionary<IKcpConversation, byte> _activeConversations;
+
     public KcpScheduler(int workerThreadCount)
     {
         _timingWheel = new ConcurrentQueue<IKcpConversation>[_wheelSize];
@@ -24,6 +27,8 @@ internal sealed class KcpScheduler : IDisposable
         {
             _timingWheel[i] = new ConcurrentQueue<IKcpConversation>();
         }
+
+        _activeConversations = new ConcurrentDictionary<IKcpConversation, byte>();
 
         _workQueue = Channel.CreateUnbounded<KcpConversation>(new UnboundedChannelOptions
         {
@@ -58,9 +63,21 @@ internal sealed class KcpScheduler : IDisposable
 
     public void ScheduleTimer(IKcpConversation conversation, int delayMs)
     {
-        if (_stopped) return;
+        if (_stopped || !_activeConversations.ContainsKey(conversation)) return;
         int targetTick = (int)((_currentTick + (uint)delayMs) % _wheelSize);
         _timingWheel[targetTick].Enqueue(conversation);
+    }
+
+    public void RegisterConversation(IKcpConversation conversation)
+    {
+        if (_stopped) return;
+        _activeConversations.TryAdd(conversation, 0);
+    }
+
+    public void UnscheduleConversation(IKcpConversation conversation)
+    {
+        if (_stopped) return;
+        _activeConversations.TryRemove(conversation, out _);
     }
 
     private void WorkerLoop()
@@ -129,7 +146,7 @@ internal sealed class KcpScheduler : IDisposable
                     int itemsToProcess = queue.Count;
                     while (itemsToProcess > 0 && queue.TryDequeue(out var conversation))
                     {
-                        if (conversation is KcpConversation kcpConv && !kcpConv.TransportClosed)
+                    if (_activeConversations.ContainsKey(conversation) && conversation is KcpConversation kcpConv && !kcpConv.TransportClosed)
                         {
                             EnqueueWork(kcpConv);
                             ScheduleTimer(conversation, 100);

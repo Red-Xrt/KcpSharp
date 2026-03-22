@@ -161,10 +161,9 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         int count = _batchCount;
         _batchCount = 0;
 
-        Task? pendingTask = null;
-        for (int i = 0; i < count; i++)
+        try
         {
-            try
+            for (int i = 0; i < count; i++)
             {
                 var task = _socket.SendToAsync(_batchBuffers[i].AsMemory(0, _batchSizes[i]),
                              SocketFlags.None,
@@ -173,20 +172,34 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
                 if (!task.IsCompletedSuccessfully)
                 {
-                    pendingTask = pendingTask == null ? task.AsTask() : Task.WhenAll(pendingTask, task.AsTask());
+                    // Fall back to awaiting the rest of the batch sequentially.
+                    return FinishFlushBatchAsync(task.AsTask(), i + 1, count, cancellationToken);
                 }
             }
-            catch (SocketException) { }
         }
-
-        if (pendingTask != null)
-        {
-            return new ValueTask(pendingTask);
-        }
+        catch (SocketException) { }
 
         return default;
 #endif
     }
+
+#if !(NET8_0_OR_GREATER && HAS_SENDMESSAGESASYNC)
+    private async ValueTask FinishFlushBatchAsync(Task firstTask, int startIndex, int count, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await firstTask.ConfigureAwait(false);
+            for (int i = startIndex; i < count; i++)
+            {
+                await _socket.SendToAsync(_batchBuffers[i].AsMemory(0, _batchSizes[i]),
+                             SocketFlags.None,
+                             _batchEndpoints[i]!,
+                             cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (SocketException) { }
+    }
+#endif
 
     /// <summary>
     ///     Create the upper-level connection instance.
@@ -252,8 +265,17 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     {
         if (_scheduler != null && !_disposed)
         {
+            _scheduler.RegisterConversation(conversation);
             conversation.OnWorkAvailable = () => _scheduler.EnqueueWork(conversation);
             _scheduler.ScheduleTimer(conversation, 100);
+        }
+    }
+
+    internal void UnscheduleConversation(KcpConversation conversation)
+    {
+        if (_scheduler != null && !_disposed)
+        {
+            _scheduler.UnscheduleConversation(conversation);
         }
     }
 
@@ -309,7 +331,16 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                         bytesReceived = receiveTask.AsTask().GetAwaiter().GetResult();
                     }
 
-                    endpoint = (IPEndPoint)remoteEndpoint.Create(reusableSocketAddress);
+                    if (reusableSocketAddress.Family == AddressFamily.InterNetwork)
+                    {
+                        long ip = (long)reusableSocketAddress[4] | ((long)reusableSocketAddress[5] << 8) | ((long)reusableSocketAddress[6] << 16) | ((long)reusableSocketAddress[7] << 24);
+                        int port = (reusableSocketAddress[2] << 8) | reusableSocketAddress[3];
+                        endpoint = new IPEndPoint(new IPAddress(ip), port);
+                    }
+                    else
+                    {
+                        endpoint = (IPEndPoint)remoteEndpoint.Create(reusableSocketAddress);
+                    }
                 }
                 catch (OperationCanceledException)
                 {
