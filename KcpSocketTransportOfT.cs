@@ -31,8 +31,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     private const int MaxBatchSize = 32;
 
     private int _packetsSentLastSecond;
-    private long _lastBatchTick;
-    private int _effectiveBatchSize = 16;
+    private volatile long _lastBatchTick;
+    private volatile int _effectiveBatchSize = 16;
 
     /// <summary>
     ///     Construct a socket transport with the specified socket and remote endpoint.

@@ -110,16 +110,18 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
         if (_disposed) return;
         lock (SyncRoot)
         {
-            if (_disposed || _notificationPending) return;
-            if (_activeWait && !_signaled)
+            if (!_disposed && !_notificationPending)
             {
-                _signaled = true;
-                _cancellationToken = default;
-                _mrvtsc.SetResult(default);
-            }
-            else
-            {
-                _notificationPending = true;
+                if (_activeWait && !_signaled)
+                {
+                    _signaled = true;
+                    _cancellationToken = default;
+                    _mrvtsc.SetResult(default);
+                }
+                else
+                {
+                    _notificationPending = true;
+                }
             }
         }
         OnActivated?.Invoke();
