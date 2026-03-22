@@ -15,7 +15,7 @@ internal sealed class KcpScheduler : IDisposable
     // Hashed Timing Wheel variables
     private readonly ConcurrentQueue<IKcpConversation>[] _timingWheel;
     private readonly int _wheelSize = 512;
-    private uint _currentTick;
+    private volatile uint _currentTick;
 
     public KcpScheduler(int workerThreadCount)
     {

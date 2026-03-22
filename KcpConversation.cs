@@ -256,10 +256,17 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         {
             _ts_flush += _interval;
             if (TimeDiff(current, _ts_flush) >= 0) _ts_flush = current + _interval;
-            var flushTask = FlushCoreAsync(CancellationToken.None);
-            if (!flushTask.IsCompletedSuccessfully)
+            try
             {
-                _ = flushTask.AsTask();
+                var flushTask = FlushCoreAsync(CancellationToken.None);
+                if (!flushTask.IsCompletedSuccessfully)
+                {
+                    _ = flushTask.AsTask();
+                }
+            }
+            catch (Exception ex)
+            {
+                HandleFlushException(ex);
             }
         }
 
@@ -272,7 +279,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         if (TransportClosed) return;
 
         // Ensure only one thread processes updates for this conversation at a time
-        if (Interlocked.CompareExchange(ref _isProcessing, 1, 0) != 0) return;
+        int currentThreadId = Environment.CurrentManagedThreadId;
+        if (Interlocked.CompareExchange(ref _isProcessing, currentThreadId, 0) != 0) return;
 
         try
         {
@@ -298,22 +306,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         }
                     }
                     bufferOwner?.Dispose();
-                }
-            }
-
-            if (anyUpdate && !TransportClosed)
-            {
-                try
-                {
-                    var flushTask = UpdateCoreAsync(CancellationToken.None);
-                    if (!flushTask.IsCompletedSuccessfully)
-                    {
-                        _ = flushTask.AsTask();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    HandleFlushException(ex);
                 }
             }
 
@@ -950,25 +942,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         return 0;
     }
 
-    private ValueTask UpdateCoreAsync(CancellationToken cancellationToken)
-    {
-        var current = GetTimestamp();
-        long slap = TimeDiff(current, _ts_flush);
-        if (slap > 10000 || slap < -10000)
-        {
-            _ts_flush = current;
-            slap = 0;
-        }
-
-        if (slap >= 0 || _nodelay)
-        {
-            _ts_flush += _interval;
-            if (TimeDiff(current, _ts_flush) >= 0) _ts_flush = current + _interval;
-            return FlushCoreAsync(cancellationToken);
-        }
-
-        return default;
-    }
 
     private bool HandleFlushException(Exception ex)
     {
@@ -1551,12 +1524,23 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     {
         TransportClosed = true;
 
-        // Ensure background processing is safely interrupted
-        int spinWait = 0;
-        while (Interlocked.CompareExchange(ref _isProcessing, 1, 0) != 0)
+        // Ensure background processing is safely interrupted, avoiding deadlocks if we are already the processor
+        bool tookLock = false;
+        int currentThreadId = Environment.CurrentManagedThreadId;
+
+        if (Interlocked.CompareExchange(ref _isProcessing, currentThreadId, 0) == 0)
         {
-            if (spinWait++ > 100) Thread.Sleep(1);
-            else Thread.SpinWait(10);
+            tookLock = true;
+        }
+        else if (Volatile.Read(ref _isProcessing) != currentThreadId)
+        {
+            int spinWait = 0;
+            while (Interlocked.CompareExchange(ref _isProcessing, currentThreadId, 0) != 0)
+            {
+                if (spinWait++ > 100) Thread.Sleep(1);
+                else Thread.SpinWait(10);
+            }
+            tookLock = true;
         }
 
         try
@@ -1622,7 +1606,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
         finally
         {
-            Volatile.Write(ref _isProcessing, 0);
+            if (tookLock)
+            {
+                Volatile.Write(ref _isProcessing, 0);
+            }
         }
     }
 

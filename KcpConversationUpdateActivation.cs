@@ -30,7 +30,7 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
             target.Notify();
         }, this, interval, interval);
         _mrvtsc = new ManualResetValueTaskSourceCore<KcpConversationUpdateNotification>
-            { RunContinuationsAsynchronously = true };
+            { RunContinuationsAsynchronously = false };
         _waitList = new WaitList(this);
     }
 

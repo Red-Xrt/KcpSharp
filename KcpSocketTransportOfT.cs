@@ -78,16 +78,22 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         return SendCoreAsync(packet, endpoint, cancellationToken);
     }
 
-    private async ValueTask SendCoreAsync(Memory<byte> packet, IPEndPoint endpoint,
+    private ValueTask SendCoreAsync(Memory<byte> packet, IPEndPoint endpoint,
         CancellationToken cancellationToken)
     {
         try
         {
-            await _socket
-                .SendToAsync(packet, SocketFlags.None, endpoint, cancellationToken)
-                .ConfigureAwait(false);
+            var task = _socket.SendToAsync(packet, SocketFlags.None, endpoint, cancellationToken);
+            if (task.IsCompletedSuccessfully)
+            {
+                return default;
+            }
+            return new ValueTask(task.AsTask());
         }
-        catch (SocketException) { }
+        catch (SocketException)
+        {
+            return default;
+        }
     }
 
     int IKcpBatchTransport.BatchCapacity => MaxBatchSize - _batchCount;
@@ -123,9 +129,9 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         _batchCount++;
     }
 
-    async ValueTask IKcpBatchTransport.FlushBatchAsync(CancellationToken cancellationToken)
+    ValueTask IKcpBatchTransport.FlushBatchAsync(CancellationToken cancellationToken)
     {
-        if (_batchCount == 0) return;
+        if (_batchCount == 0) return default;
 
 #if NET8_0_OR_GREATER && HAS_SENDMESSAGESASYNC
         // Giả sử API này tồn tại trong tương lai hoặc extension method custom
@@ -137,30 +143,49 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                 _batchEndpoints[i]!);
         }
         
+        _batchCount = 0;
         try
         {
-            await _socket
-                .SendMessagesAsync(datagrams, SocketFlags.None, cancellationToken)
-                .ConfigureAwait(false);
+            var task = _socket.SendMessagesAsync(datagrams, SocketFlags.None, cancellationToken);
+            if (task.IsCompletedSuccessfully)
+            {
+                return default;
+            }
+            return new ValueTask(task.AsTask());
         }
-        catch (SocketException) { }
+        catch (SocketException)
+        {
+            return default;
+        }
 #else
-        for (int i = 0; i < _batchCount; i++)
+        int count = _batchCount;
+        _batchCount = 0;
+
+        Task? pendingTask = null;
+        for (int i = 0; i < count; i++)
         {
             try
             {
-                await _socket
-                    .SendToAsync(_batchBuffers[i].AsMemory(0, _batchSizes[i]),
-                                 SocketFlags.None,
-                                 _batchEndpoints[i]!,
-                                 cancellationToken)
-                    .ConfigureAwait(false);
+                var task = _socket.SendToAsync(_batchBuffers[i].AsMemory(0, _batchSizes[i]),
+                             SocketFlags.None,
+                             _batchEndpoints[i]!,
+                             cancellationToken);
+
+                if (!task.IsCompletedSuccessfully)
+                {
+                    pendingTask = pendingTask == null ? task.AsTask() : Task.WhenAll(pendingTask, task.AsTask());
+                }
             }
             catch (SocketException) { }
         }
-#endif
 
-        _batchCount = 0;
+        if (pendingTask != null)
+        {
+            return new ValueTask(pendingTask);
+        }
+
+        return default;
+#endif
     }
 
     /// <summary>
@@ -274,19 +299,17 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                 IPEndPoint? endpoint = null;
                 try
                 {
-                    var receiveTask = _socket.ReceiveMessageFromAsync(bufferOwner.Memory, System.Net.Sockets.SocketFlags.None, remoteEndpoint, cancellationToken);
-                    SocketReceiveMessageFromResult receiveResult;
+                    var receiveTask = _socket.ReceiveFromAsync(bufferOwner.Memory, System.Net.Sockets.SocketFlags.None, reusableSocketAddress);
                     if (receiveTask.IsCompletedSuccessfully)
                     {
-                        receiveResult = receiveTask.Result;
+                        bytesReceived = receiveTask.Result;
                     }
                     else
                     {
-                        receiveResult = receiveTask.AsTask().GetAwaiter().GetResult();
+                        bytesReceived = receiveTask.AsTask().GetAwaiter().GetResult();
                     }
 
-                    bytesReceived = receiveResult.ReceivedBytes;
-                    endpoint = (IPEndPoint)receiveResult.RemoteEndPoint;
+                    endpoint = (IPEndPoint)remoteEndpoint.Create(reusableSocketAddress);
                 }
                 catch (OperationCanceledException)
                 {
