@@ -248,11 +248,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
     private volatile int _flushPending;
 
-    internal void Tick()
-    {
-        ProcessUpdate();
-    }
-
     internal void ProcessUpdate()
     {
         if (TransportClosed)
@@ -318,10 +313,16 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                             isAsync = true;
                             flushTask.AsTask().ContinueWith(_ =>
                             {
-                                Volatile.Write(ref _flushPending, 0);
-                                Volatile.Write(ref _isProcessing, 0);
-                                if (TransportClosed) DoCleanup();
-                                else if (_updateActivation?.HasPendingPackets == true) OnWorkAvailable?.Invoke();
+                                try
+                                {
+                                    if (TransportClosed) DoCleanup();
+                                    else if (_updateActivation?.HasPendingPackets == true) OnWorkAvailable?.Invoke();
+                                }
+                                finally
+                                {
+                                    Volatile.Write(ref _flushPending, 0);
+                                    Volatile.Write(ref _isProcessing, 0);
+                                }
                             });
                         }
                     }
