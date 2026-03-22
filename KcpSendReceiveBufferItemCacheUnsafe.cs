@@ -43,4 +43,12 @@ internal struct KcpSendReceiveBufferItemCacheUnsafe
         node.ValueRef = default;
         _items.AddLast(node);
     }
+
+    public void PreAllocate(int count)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            _items.AddLast(new LinkedListNodeOfBufferItem(default));
+        }
+    }
 }

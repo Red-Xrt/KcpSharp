@@ -22,6 +22,8 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
 
     internal object SyncRoot => _syncRoot;
 
+    internal Action? OnNotify;
+
     public KcpConversationUpdateActivation(int interval, bool useTimer = false)
     {
         if (useTimer)
@@ -120,6 +122,7 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
                 _notificationPending = true;
             }
         }
+        OnNotify?.Invoke();
     }
 
     private void NotifyPacketReceived()

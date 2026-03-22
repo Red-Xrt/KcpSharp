@@ -197,6 +197,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         StreamMode = options is not null && options.StreamMode;
 
         _updateActivation = new KcpConversationUpdateActivation((int)_interval);
+        _updateActivation.OnNotify = () => OnWorkAvailable?.Invoke();
+
         _queueItemCache = new KcpSendReceiveQueueItemCache();
         _sendQueue = new KcpSendQueue(_bufferPool, _updateActivation, StreamMode,
             options is null || options.SendQueueSize <= 0
@@ -236,6 +238,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         _sndBufIndex = new Dictionary<uint, LinkedListNodeOfBufferItem>((int)_snd_wnd * 2);
         _rcvBufSnSet = new HashSet<uint>((int)_rcv_wnd);
+
+        // Pre-size pools according to Phase 7
+        _sndCache.PreAllocate((int)_snd_wnd * 2);
+        _rcvCache.PreAllocate((int)_rcv_wnd * 2);
 
         // Scheduler will now call ProcessPacket and Tick, so we do not run RunUpdateOnActivation.
     }
