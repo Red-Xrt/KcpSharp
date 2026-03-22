@@ -135,7 +135,9 @@ internal sealed class KcpScheduler : IDisposable
                 continue;
             }
 
-            // Catch up on any missed ticks due to Thread.Sleep drift
+            // Catch up on any missed ticks due to Thread.Sleep drift. Cap at 100ms to prevent storming the WorkQueue on severe thread starvation.
+            elapsedMs = Math.Min(elapsedMs, 100);
+
             for (int i = 0; i < elapsedMs; i++)
             {
                 int slot = (int)(_currentTick % _wheelSize);

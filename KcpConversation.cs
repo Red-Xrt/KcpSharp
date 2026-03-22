@@ -246,48 +246,25 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         // Scheduler will now call ProcessPacket and Tick, so we do not run RunUpdateOnActivation.
     }
 
+    private volatile int _flushPending;
+
     internal void Tick()
     {
-        if (TransportClosed) return;
-
-        var current = GetTimestamp();
-        long slap = TimeDiff(current, _ts_flush);
-        if (slap > 10000 || slap < -10000)
-        {
-            _ts_flush = current;
-            slap = 0;
-        }
-
-        if (slap >= 0 || _nodelay)
-        {
-            _ts_flush += _interval;
-            if (TimeDiff(current, _ts_flush) >= 0) _ts_flush = current + _interval;
-            try
-            {
-                var flushTask = FlushCoreAsync(CancellationToken.None);
-                if (!flushTask.IsCompletedSuccessfully)
-                {
-                    _ = flushTask.AsTask();
-                }
-            }
-            catch (Exception ex)
-            {
-                HandleFlushException(ex);
-            }
-        }
-
-        if (_keepAliveEnabled && TimeDiff(GetTimestamp(), _lastReceiveTick) > _keepAliveGracePeriod)
-            SetTransportClosed();
+        ProcessUpdate();
     }
 
     internal void ProcessUpdate()
     {
-        if (TransportClosed) return;
+        if (TransportClosed)
+        {
+            DoCleanup();
+            return;
+        }
 
-        // Ensure only one thread processes updates for this conversation at a time
         int currentThreadId = Environment.CurrentManagedThreadId;
         if (Interlocked.CompareExchange(ref _isProcessing, currentThreadId, 0) != 0) return;
 
+        bool isAsync = false;
         try
         {
             var activation = _updateActivation;
@@ -315,17 +292,71 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 }
             }
 
-            Tick();
+            var current = GetTimestamp();
+            long slap = TimeDiff(current, _ts_flush);
+            if (slap > 10000 || slap < -10000)
+            {
+                _ts_flush = current;
+                slap = 0;
+            }
+
+            if ((anyUpdate || slap >= 0 || _nodelay) && !TransportClosed)
+            {
+                if (Interlocked.CompareExchange(ref _flushPending, 1, 0) == 0)
+                {
+                    try
+                    {
+                        if (slap >= 0 || _nodelay)
+                        {
+                            _ts_flush += _interval;
+                            if (TimeDiff(current, _ts_flush) >= 0) _ts_flush = current + _interval;
+                        }
+
+                        var flushTask = FlushCoreAsync(CancellationToken.None);
+                        if (!flushTask.IsCompletedSuccessfully)
+                        {
+                            isAsync = true;
+                            flushTask.AsTask().ContinueWith(_ =>
+                            {
+                                Volatile.Write(ref _flushPending, 0);
+                                Volatile.Write(ref _isProcessing, 0);
+                                if (TransportClosed) DoCleanup();
+                                else if (_updateActivation?.HasPendingPackets == true) OnWorkAvailable?.Invoke();
+                            });
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        HandleFlushException(ex);
+                    }
+                    finally
+                    {
+                        if (!isAsync)
+                        {
+                            Volatile.Write(ref _flushPending, 0);
+                        }
+                    }
+                }
+            }
+
+            if (_keepAliveEnabled && TimeDiff(GetTimestamp(), _lastReceiveTick) > _keepAliveGracePeriod)
+            {
+                SetTransportClosed();
+            }
         }
         finally
         {
-            Volatile.Write(ref _isProcessing, 0);
-
-            // If a packet was enqueued right as we were finishing and releasing the lock,
-            // we should notify again to ensure it doesn't wait until the next timer tick.
-            if (_updateActivation is not null && _updateActivation.HasPendingPackets)
+            if (!isAsync)
             {
-                OnWorkAvailable?.Invoke();
+                Volatile.Write(ref _isProcessing, 0);
+                if (TransportClosed)
+                {
+                    DoCleanup();
+                }
+                else if (_updateActivation?.HasPendingPackets == true)
+                {
+                    OnWorkAvailable?.Invoke();
+                }
             }
         }
     }
@@ -1539,37 +1570,29 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     {
         TransportClosed = true;
 
-        // Ensure background processing is safely interrupted, avoiding deadlocks if we are already the processor
-        bool tookLock = false;
-        int currentThreadId = Environment.CurrentManagedThreadId;
-
-        if (Interlocked.CompareExchange(ref _isProcessing, currentThreadId, 0) == 0)
+        if (Interlocked.CompareExchange(ref _isProcessing, -1, 0) == 0)
         {
-            tookLock = true;
+            DoCleanup();
+            Volatile.Write(ref _isProcessing, 0);
         }
-        else if (Volatile.Read(ref _isProcessing) != currentThreadId)
+    }
+
+    private int _cleanupDone;
+
+    private void DoCleanup()
+    {
+        if (Interlocked.CompareExchange(ref _cleanupDone, 1, 0) != 0) return;
+
+        Interlocked.Exchange(ref _updateActivation, null)?.Dispose();
+        var updateLoopCts = Interlocked.Exchange(ref _updateLoopCts, null);
+        if (updateLoopCts is not null)
         {
-            int spinWait = 0;
-            while (Interlocked.CompareExchange(ref _isProcessing, currentThreadId, 0) != 0)
-            {
-                if (spinWait++ > 100) Thread.Sleep(1);
-                else Thread.SpinWait(10);
-            }
-            tookLock = true;
+            updateLoopCts.Cancel();
+            updateLoopCts.Dispose();
         }
 
-        try
-        {
-            Interlocked.Exchange(ref _updateActivation, null)?.Dispose();
-            var updateLoopCts = Interlocked.Exchange(ref _updateLoopCts, null);
-            if (updateLoopCts is not null)
-            {
-                updateLoopCts.Cancel();
-                updateLoopCts.Dispose();
-            }
-
-            _sendQueue.SetTransportClosed();
-            _receiveQueue.SetTransportClosed();
+        _sendQueue.SetTransportClosed();
+        _receiveQueue.SetTransportClosed();
 
         // Fix BUG-C1: Collect nodes first under _sndBuf lock to prevent deadlock with FlushCoreAsync
         var sndNodesToRelease = new System.Collections.Generic.List<LinkedListNode<KcpSendReceiveBufferItem>>();
@@ -1587,12 +1610,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         foreach (var node in sndNodesToRelease)
         {
-            // Note: _sndBuf.Clear() was called above, so these nodes are no longer in the list.
-            // FlushCoreAsync iterates over _sndBuf with a lock on each node.
-            // There is a small window between _sndBuf.Clear() and this lock where
-            // FlushCoreAsync might have obtained a reference to a node and is waiting on its lock.
-            // This is intentional: locking here serializes access to the node's data release,
-            // preventing the buffer from being released while FlushCoreAsync is processing it.
             lock (node)
             {
                 var data = node.ValueRef.Data;
@@ -1618,14 +1635,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
 
         _queueItemCache.Clear();
-        }
-        finally
-        {
-            if (tookLock)
-            {
-                Volatile.Write(ref _isProcessing, 0);
-            }
-        }
     }
 
     /// <inheritdoc />
