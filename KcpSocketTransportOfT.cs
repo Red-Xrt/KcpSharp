@@ -244,6 +244,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         _scheduler = new KcpScheduler(workerThreadCount: 2); // default 2 workers
         if (_connection is KcpConversation kcpConv)
         {
+            _scheduler.RegisterConversation(kcpConv);
             kcpConv.OnWorkAvailable = () => _scheduler.EnqueueWork(kcpConv);
             _scheduler.ScheduleTimer(kcpConv, 100);
         }
