@@ -25,7 +25,7 @@ internal struct KcpSendReceiveBufferItemCacheUnsafe
         }
         else
         {
-            _items.Remove(node);
+            _items.RemoveFirst();
             node.ValueRef = item;
             if (_count > 0) _count--;
         }

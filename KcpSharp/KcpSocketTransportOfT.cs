@@ -64,7 +64,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     private int _batchCount;
     private int _activeSet;
     private volatile bool _anyPacketCommitted;
-    private const int MaxBatchSize = 16;
+    private readonly int _maxBatchSize;
     private readonly System.Threading.Lock _batchLock = new();
     private readonly SemaphoreSlim _flushSemaphore = new(1, 1);
 
@@ -77,34 +77,43 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     /// </summary>
     /// <param name="socket">The socket instance.</param>
     /// <param name="mtu">The maximum packet size that can be transmitted.</param>
+    /// <param name="maxBatchSize">The maximum number of packets to batch.</param>
     /// <param name="receiveBufferPoolSize">The size of the pool to allocate receive buffers.</param>
-    protected KcpSocketTransport(Socket socket, int mtu, int receiveBufferPoolSize = 8)
+    protected KcpSocketTransport(Socket socket, int mtu, int maxBatchSize, int receiveBufferPoolSize = 8)
     {
         _socket = socket ?? throw new ArgumentNullException(nameof(socket));
         _mtu = mtu;
         _receiveBufferPoolSize = receiveBufferPoolSize;
         if (mtu < 50) throw new ArgumentOutOfRangeException(nameof(mtu));
         if (receiveBufferPoolSize <= 0) throw new ArgumentOutOfRangeException(nameof(receiveBufferPoolSize));
+        if (maxBatchSize < 0) throw new ArgumentOutOfRangeException(nameof(maxBatchSize), "MaxBatchSize must be non-negative.");
+
+        _maxBatchSize = maxBatchSize;
 
         _batchBuffers = new byte[2][][];
         _batchEndpoints = new IPEndPoint?[2][];
         _batchSizes = new int[2][];
         _batchAddresses = new byte[2][][];
         _batchAddressLengths = new int[2][];
-        for (int s = 0; s < 2; s++)
-        {
-            _batchBuffers[s] = new byte[MaxBatchSize][];
-            _batchAddresses[s] = new byte[MaxBatchSize][];
-            for (int i = 0; i < MaxBatchSize; i++)
-            {
-                _batchBuffers[s][i] = GC.AllocateUninitializedArray<byte>(_mtu, pinned: true);
-                _batchAddresses[s][i] = new byte[128]; // Max SocketAddress size
-            }
 
-            _batchEndpoints[s] = new IPEndPoint[MaxBatchSize];
-            _batchSizes[s] = new int[MaxBatchSize];
-            _batchAddressLengths[s] = new int[MaxBatchSize];
+        if (maxBatchSize > 0)
+        {
+            for (int s = 0; s < 2; s++)
+            {
+                _batchBuffers[s] = new byte[maxBatchSize][];
+                _batchAddresses[s] = new byte[maxBatchSize][];
+                for (int i = 0; i < maxBatchSize; i++)
+                {
+                    _batchBuffers[s][i] = GC.AllocateUninitializedArray<byte>(_mtu, pinned: true);
+                    _batchAddresses[s][i] = new byte[128]; // Max SocketAddress size
+                }
+
+                _batchEndpoints[s] = new IPEndPoint[maxBatchSize];
+                _batchSizes[s] = new int[maxBatchSize];
+                _batchAddressLengths[s] = new int[maxBatchSize];
+            }
         }
+
         _batchCount = 0;
         _activeSet = 0;
     }
@@ -149,15 +158,17 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         }
     }
 
-    int IKcpBatchTransport.BatchCapacity => MaxBatchSize - Volatile.Read(ref _batchCount);
+    int IKcpBatchTransport.BatchCapacity => _maxBatchSize - Volatile.Read(ref _batchCount);
 
     bool IKcpBatchTransport.TryGetBatchSliceAndCommit(int requiredSize, IPEndPoint endpoint, Action<Memory<byte>> dataWriter)
     {
+        if (_maxBatchSize <= 1) return false;
+
         int slotIndex;
         int activeSet;
         lock (_batchLock)
         {
-            if (_batchCount >= MaxBatchSize || requiredSize > _mtu)
+            if (_batchCount >= _maxBatchSize || requiredSize > _mtu)
             {
                 return false;
             }
@@ -209,55 +220,75 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
             {
                 unsafe
                 {
-                    var msgvec = stackalloc KcpSocketTransportNative.mmsghdr[MaxBatchSize];
-                    var iovecs = stackalloc KcpSocketTransportNative.iovec[MaxBatchSize];
-                    byte[] socketAddresses = ArrayPool<byte>.Shared.Rent(MaxBatchSize * 128);
+                    KcpSocketTransportNative.mmsghdr[]? msgvecPool = null;
+                    KcpSocketTransportNative.iovec[]? iovecsPool = null;
+                    Span<KcpSocketTransportNative.mmsghdr> msgvec;
+                    Span<KcpSocketTransportNative.iovec> iovecs;
+
+                    if (countToFlush <= 32)
+                    {
+                        msgvec = stackalloc KcpSocketTransportNative.mmsghdr[countToFlush];
+                        iovecs = stackalloc KcpSocketTransportNative.iovec[countToFlush];
+                    }
+                    else
+                    {
+                        msgvecPool = ArrayPool<KcpSocketTransportNative.mmsghdr>.Shared.Rent(countToFlush);
+                        iovecsPool = ArrayPool<KcpSocketTransportNative.iovec>.Shared.Rent(countToFlush);
+                        msgvec = msgvecPool.AsSpan(0, countToFlush);
+                        iovecs = iovecsPool.AsSpan(0, countToFlush);
+                    }
+
+                    byte[] socketAddresses = ArrayPool<byte>.Shared.Rent(countToFlush * 128);
 
                     try
                     {
                         fixed (byte* pAddrStr = socketAddresses)
                         {
-                            for (int i = 0; i < countToFlush; i++)
+                            fixed (KcpSocketTransportNative.iovec* pIovecs = iovecs)
+                            fixed (KcpSocketTransportNative.mmsghdr* msgvecPtr = msgvec)
                             {
-                                // _batchBuffers is allocated with pinned: true
-                                ref byte firstByte = ref _batchBuffers[activeSet][i][0];
-                                iovecs[i].iov_base = System.Runtime.CompilerServices.Unsafe.AsPointer(ref firstByte);
-                                iovecs[i].iov_len = (nuint)_batchSizes[activeSet][i];
-
-                                int addrLen = _batchAddressLengths[activeSet][i];
-
-                                byte* pAddr = pAddrStr + (i * 128);
-                                fixed (byte* srcAddr = _batchAddresses[activeSet][i])
+                                for (int i = 0; i < countToFlush; i++)
                                 {
-                                    for (int j = 0; j < addrLen; j++)
+                                    // _batchBuffers is allocated with pinned: true
+                                    ref byte firstByte = ref _batchBuffers[activeSet][i][0];
+                                    pIovecs[i].iov_base = System.Runtime.CompilerServices.Unsafe.AsPointer(ref firstByte);
+                                    pIovecs[i].iov_len = (nuint)_batchSizes[activeSet][i];
+
+                                    int addrLen = _batchAddressLengths[activeSet][i];
+
+                                    byte* pAddr = pAddrStr + (i * 128);
+                                    fixed (byte* srcAddr = _batchAddresses[activeSet][i])
                                     {
-                                        pAddr[j] = srcAddr[j];
+                                        for (int j = 0; j < addrLen; j++)
+                                        {
+                                            pAddr[j] = srcAddr[j];
+                                        }
                                     }
+
+                                    msgvecPtr[i].msg_hdr.msg_name = pAddr;
+                                    msgvecPtr[i].msg_hdr.msg_namelen = (uint)addrLen;
+                                    msgvecPtr[i].msg_hdr.msg_iov = &pIovecs[i];
+                                    msgvecPtr[i].msg_hdr.msg_iovlen = 1;
+                                    msgvecPtr[i].msg_hdr.msg_control = null;
+                                    msgvecPtr[i].msg_hdr.msg_controllen = 0;
+                                    msgvecPtr[i].msg_hdr.msg_flags = 0;
+                                    msgvecPtr[i].msg_len = 0;
                                 }
 
-                                msgvec[i].msg_hdr.msg_name = pAddr;
-                                msgvec[i].msg_hdr.msg_namelen = (uint)addrLen;
-                                msgvec[i].msg_hdr.msg_iov = &iovecs[i];
-                                msgvec[i].msg_hdr.msg_iovlen = 1;
-                                msgvec[i].msg_hdr.msg_control = null;
-                                msgvec[i].msg_hdr.msg_controllen = 0;
-                                msgvec[i].msg_hdr.msg_flags = 0;
-                                msgvec[i].msg_len = 0;
-                            }
-
-                            int sockfd = _socket.Handle.ToInt32();
-                            int sent = 0;
-                            while (sent < countToFlush)
-                            {
-                                int ret = KcpSocketTransportNative.sendmmsg(sockfd, msgvec + sent, (uint)(countToFlush - sent), 0);
-                                if (ret < 0)
+                                int sockfd = _socket.Handle.ToInt32();
+                                int sent = 0;
+                                while (sent < countToFlush)
                                 {
-                                    int error = Marshal.GetLastWin32Error();
-                                    // Handle EINTR or EAGAIN/EWOULDBLOCK if needed, here we just throw or fallback
-                                    if (error == 4 /* EINTR */) continue;
-                                    throw new SocketException(error);
+                                    int ret = KcpSocketTransportNative.sendmmsg(sockfd, msgvecPtr + sent, (uint)(countToFlush - sent), 0);
+                                    if (ret < 0)
+                                    {
+                                        int error = Marshal.GetLastWin32Error();
+                                        // Handle EINTR or EAGAIN/EWOULDBLOCK if needed, here we just throw or fallback
+                                        if (error == 4 /* EINTR */) continue;
+                                        throw new SocketException(error);
+                                    }
+                                    sent += ret;
                                 }
-                                sent += ret;
                             }
                         }
                     }
@@ -269,6 +300,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                     finally
                     {
                         ArrayPool<byte>.Shared.Return(socketAddresses);
+                        if (msgvecPool != null) ArrayPool<KcpSocketTransportNative.mmsghdr>.Shared.Return(msgvecPool);
+                        if (iovecsPool != null) ArrayPool<KcpSocketTransportNative.iovec>.Shared.Return(iovecsPool);
                     }
                 }
             }

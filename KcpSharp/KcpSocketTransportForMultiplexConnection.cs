@@ -11,14 +11,14 @@ internal sealed class KcpSocketTransportForMultiplexConnection<T> : KcpSocketTra
     private Func<ReadOnlyMemory<byte>, System.Net.IPEndPoint, bool>? _rawPacketHandler;
 
     internal KcpSocketTransportForMultiplexConnection(Socket socket, int mtu, int receiveBufferPoolSize = 8)
-        : base(socket, mtu, receiveBufferPoolSize)
+        : base(socket, mtu, 16, receiveBufferPoolSize) // Default multiplex max batch size to 16 if not configured
     {
     }
 
     private readonly bool _ownsSocket;
 
     internal KcpSocketTransportForMultiplexConnection(Socket socket, int mtu, Action<T?>? disposeAction, int receiveBufferPoolSize = 8, bool ownsSocket = false)
-        : base(socket, mtu, receiveBufferPoolSize)
+        : base(socket, mtu, 16, receiveBufferPoolSize) // Default multiplex max batch size to 16 if not configured
     {
         _disposeAction = disposeAction;
         _ownsSocket = ownsSocket;
