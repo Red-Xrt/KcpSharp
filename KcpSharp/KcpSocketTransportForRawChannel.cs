@@ -16,7 +16,9 @@ internal sealed class KcpSocketTransportForRawChannel : KcpSocketTransport<KcpRa
 
     internal KcpSocketTransportForRawChannel(Socket socket, IPEndPoint endPoint, uint? conversationId,
         KcpRawChannelOptions? options, int receiveBufferPoolSize = 8, bool ownsSocket = false)
-        : base(socket, options?.Mtu ?? KcpConversationOptions.MtuDefaultValue, receiveBufferPoolSize)
+        : base(socket, options?.Mtu ?? KcpConversationOptions.MtuDefaultValue,
+               options?.EnableBatching == false ? 0 : (options?.MaxBatchSize ?? 16),
+               receiveBufferPoolSize)
     {
         _conversationId = conversationId;
         _remoteEndPoint = endPoint;

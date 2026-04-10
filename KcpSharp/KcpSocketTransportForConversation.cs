@@ -19,7 +19,9 @@ internal sealed class KcpSocketTransportForConversation : KcpSocketTransport<Kcp
 
     internal KcpSocketTransportForConversation(Socket socket, IPEndPoint endPoint, uint? conversationId,
         KcpConversationOptions? options, int receiveBufferPoolSize = 8, bool ownsSocket = false)
-        : base(socket, options?.Mtu ?? KcpConversationOptions.MtuDefaultValue, receiveBufferPoolSize)
+        : base(socket, options?.Mtu ?? KcpConversationOptions.MtuDefaultValue,
+               options?.EnableBatching == false ? 0 : (options?.MaxBatchSize ?? 16),
+               receiveBufferPoolSize)
     {
         _conversationId = conversationId;
         _remoteEndPoint = endPoint;

@@ -108,6 +108,30 @@ public class KcpConversationOptions
     public int ReceiveQueueSize { get; set; }
 
     /// <summary>
+    ///     Whether to enable packet batching before sending to the underlying transport.
+    ///     Batching can significantly improve throughput at the cost of slight latency.
+    /// </summary>
+    public bool EnableBatching { get; set; } = true;
+
+    /// <summary>
+    ///     The maximum number of packets to batch before flushing to the underlying transport.
+    ///     Only applicable if <see cref="EnableBatching"/> is true.
+    /// </summary>
+    public int MaxBatchSize
+    {
+        get => _maxBatchSize;
+        set
+        {
+            if (value < 1 || value > 1024)
+            {
+                throw new ArgumentOutOfRangeException(nameof(value), "MaxBatchSize must be between 1 and 1024.");
+            }
+            _maxBatchSize = value;
+        }
+    }
+    private int _maxBatchSize = 16;
+
+    /// <summary>
     ///     The number of bytes to reserve at the start of buffer passed into the underlying transport. The transport should
     ///     fill this reserved space.
     /// </summary>
@@ -172,6 +196,7 @@ public class KcpConversationOptions
         RemoteReceiveWindow = 256,
         SendQueueSize = 256,
         ReceiveQueueSize = 256,
+        EnableBatching = false,
     };
 
     /// <summary>
