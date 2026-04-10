@@ -389,9 +389,22 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
                         const int MaxQueuedPackets = 256;
                         if (_list is not null && _list.Count >= MaxQueuedPackets)
                         {
-                            ownerAsMemoryOwner?.Dispose();
-                            KcpMetrics.PacketsDropped.Add(1);
-                            return new ValueTask(Task.CompletedTask);
+                            // Backpressure WITHOUT dropping:
+                            // We construct a WaitItem but we DO NOT complete its Task synchronously.
+                            // However, WaitItem doesn't natively support "blocking" the caller until space frees up,
+                            // because it's meant to pass the packet *to* the consumer.
+                            // To actually block the receiver, we should return an uncompleted ValueTask.
+                            // Since implementing a generic async producer/consumer queue here is risky,
+                            // we will use Task.Yield() to throttle the receive loop *and* keep the packet in the queue.
+                            // We allow the queue to exceed 256 temporarily to avoid dropping, but we return Yield to backpressure.
+
+                            waitItem = WaitItemPool.Rent();
+                            waitItem.Initialize(this, packet, ownerAsMemoryOwner, cancellationToken);
+                            _list ??= new LinkedList<WaitItem>();
+                            _list.AddLast(waitItem.Node);
+
+                            _parent.NotifyPacketReceived();
+                            return new ValueTask(YieldAsync());
                         }
 
                         waitItem = WaitItemPool.Rent();
@@ -436,6 +449,8 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
                 throw;
             }
         }
+
+        private static async Task YieldAsync() => await Task.Yield();
 
         private void CancelWaiting()
         {

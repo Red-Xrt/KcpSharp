@@ -6,7 +6,7 @@ namespace KcpSharp;
 internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, IDisposable
 {
     private readonly System.Threading.Lock _syncRoot = new();
-    private readonly System.Threading.SemaphoreSlim _spaceSemaphore;
+    private readonly AsyncCapacityReserve _spaceSemaphore;
 
     private readonly IKcpBufferPool _bufferPool;
     private readonly KcpSendReceiveQueueItemCacheUnsafe _cache;
@@ -49,7 +49,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         };
 
         _queue = new LinkedList<(KcpBuffer Data, byte Fragment)>();
-        _spaceSemaphore = new System.Threading.SemaphoreSlim(capacity, capacity);
+        _spaceSemaphore = new AsyncCapacityReserve(capacity);
     }
 
     public void Dispose()
@@ -319,17 +319,10 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     return false;
                 }
 
-                for (int i = 0; i < requiredSlots; i++)
+                if (!_spaceSemaphore.TryReserve(requiredSlots))
                 {
-                    if (!_spaceSemaphore.Wait(0))
-                    {
-                        if (i > 0)
-                        {
-                            _spaceSemaphore.Release(i);
-                        }
-                        bytesWritten = 0;
-                        return false;
-                    }
+                    bytesWritten = 0;
+                    return false;
                 }
             }
 
@@ -377,17 +370,22 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
             try
             {
+                if (allowPartialSend)
+                {
+                    for (int i = count; i > 0; i--)
+                    {
+                        if (_spaceSemaphore.TryReserve(i))
+                        {
+                            acquiredSlots = i;
+                            count = i;
+                            break;
+                        }
+                    }
+                    if (acquiredSlots == 0) count = 0;
+                }
+
                 while (count > 0)
                 {
-                    if (allowPartialSend && !_spaceSemaphore.Wait(0))
-                    {
-                        break;
-                    }
-                    if (allowPartialSend)
-                    {
-                        acquiredSlots++;
-                    }
-
                     var fragment = --count;
 
                     var size = buffer.Length > mss ? mss : buffer.Length;
@@ -465,39 +463,46 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         if (!_stream && count > 256)
             throw new ArgumentException("Message is too large (requires > 256 fragments).", nameof(buffer));
 
-        while (count > 0)
+        try
         {
-            await _spaceSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
-            if (_transportClosed || _disposed)
-            {
-                try { _spaceSemaphore.Release(); } catch (ObjectDisposedException) { }
-                return false;
-            }
+            await _spaceSemaphore.WaitAsync(count, cancellationToken).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
 
-            try
+        if (_transportClosed || _disposed)
+        {
+            try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
+            return false;
+        }
+
+        try
+        {
+            lock (_syncRoot)
             {
-                lock (_syncRoot)
+                if (_transportClosed || _disposed)
                 {
-                    if (_transportClosed || _disposed)
-                    {
-                        try { _spaceSemaphore.Release(); } catch (ObjectDisposedException) { }
-                        return false;
-                    }
+                    try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
+                    return false;
+                }
 
-                    // For the very first iteration, if we have stream bytes to append, do it here while holding the lock
-                    if (streamExpandBytes > 0)
+                if (streamExpandBytes > 0)
+                {
+                    var node = _queue.Last;
+                    if (node is not null)
                     {
-                        var node = _queue.Last;
-                        if (node is not null)
-                        {
-                            ref var dataRef = ref node.ValueRef.Data;
-                            dataRef = dataRef.AppendData(buffer.Span.Slice(0, streamExpandBytes));
-                            buffer = buffer.Slice(streamExpandBytes);
-                            Interlocked.Add(ref _unflushedBytes, streamExpandBytes);
-                        }
-                        streamExpandBytes = 0;
+                        ref var dataRef = ref node.ValueRef.Data;
+                        dataRef = dataRef.AppendData(buffer.Span.Slice(0, streamExpandBytes));
+                        buffer = buffer.Slice(streamExpandBytes);
+                        Interlocked.Add(ref _unflushedBytes, streamExpandBytes);
                     }
+                    streamExpandBytes = 0;
+                }
 
+                while (count > 0)
+                {
                     var fragment = --count;
                     var size = buffer.Length > mss ? mss : buffer.Length;
                     var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
@@ -508,11 +513,11 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     Interlocked.Add(ref _unflushedBytes, size);
                 }
             }
-            catch
-            {
-                _spaceSemaphore.Release();
-                throw;
-            }
+        }
+        catch
+        {
+            try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
+            throw;
         }
 
         _updateActivation.Notify();
@@ -563,38 +568,46 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         var remainingLength = originalBufferLength - streamExpandBytes;
         var count = remainingLength <= mss ? 1 : (remainingLength + mss - 1) / mss;
 
-        while (count > 0)
+        try
         {
-            await _spaceSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
-            if (_transportClosed || _disposed)
-            {
-                try { _spaceSemaphore.Release(); } catch (ObjectDisposedException) { }
-                throw new InvalidOperationException("Transport closed.");
-            }
+            await _spaceSemaphore.WaitAsync(count, cancellationToken).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            throw new InvalidOperationException("Transport closed.");
+        }
 
-            try
+        if (_transportClosed || _disposed)
+        {
+            try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
+            throw new InvalidOperationException("Transport closed.");
+        }
+
+        try
+        {
+            lock (_syncRoot)
             {
-                lock (_syncRoot)
+                if (_transportClosed || _disposed)
                 {
-                    if (_transportClosed || _disposed)
-                    {
-                        try { _spaceSemaphore.Release(); } catch (ObjectDisposedException) { }
-                        throw new InvalidOperationException("Transport closed.");
-                    }
+                    try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
+                    throw new InvalidOperationException("Transport closed.");
+                }
 
-                    if (streamExpandBytes > 0)
+                if (streamExpandBytes > 0)
+                {
+                    var node = _queue.Last;
+                    if (node is not null)
                     {
-                        var node = _queue.Last;
-                        if (node is not null)
-                        {
-                            ref var dataRef = ref node.ValueRef.Data;
-                            dataRef = dataRef.AppendData(buffer.Span.Slice(0, streamExpandBytes));
-                            buffer = buffer.Slice(streamExpandBytes);
-                            Interlocked.Add(ref _unflushedBytes, streamExpandBytes);
-                        }
-                        streamExpandBytes = 0;
+                        ref var dataRef = ref node.ValueRef.Data;
+                        dataRef = dataRef.AppendData(buffer.Span.Slice(0, streamExpandBytes));
+                        buffer = buffer.Slice(streamExpandBytes);
+                        Interlocked.Add(ref _unflushedBytes, streamExpandBytes);
                     }
+                    streamExpandBytes = 0;
+                }
 
+                while (count > 0)
+                {
                     var size = buffer.Length > mss ? mss : buffer.Length;
                     var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
                     var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Span.Slice(0, size));
@@ -605,11 +618,11 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     count--;
                 }
             }
-            catch
-            {
-                _spaceSemaphore.Release();
-                throw;
-            }
+        }
+        catch
+        {
+            try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
+            throw;
         }
 
         _updateActivation.Notify();

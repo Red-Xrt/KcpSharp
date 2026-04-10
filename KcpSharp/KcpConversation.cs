@@ -1,7 +1,7 @@
 using System.Buffers.Binary;
 using System.Net;
 using System.Runtime.CompilerServices;
-
+using System.Threading.Channels;
 
 namespace KcpSharp;
 
@@ -84,6 +84,9 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private KcpConversationUpdateActivation? _updateActivation;
     private CancellationTokenSource? _updateLoopCts;
     private int _disposed;
+
+    private readonly Channel<bool> _flushSignalChannel;
+    private Task? _flushLoopTask;
 
     private KcpRentedBuffer _cachedFlushBuffer;
 
@@ -192,6 +195,13 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         _fastlimit = 5;
         _nocwnd = options is not null && options.DisableCongestionControl;
         StreamMode = options is not null && options.StreamMode;
+
+        _flushSignalChannel = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+            SingleReader = true,
+            SingleWriter = false
+        });
 
         _updateActivation = new KcpConversationUpdateActivation((int)_interval);
         _sendQueueItemCache = new KcpSendReceiveQueueItemCacheUnsafe();
@@ -669,139 +679,153 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                     nextSn = nextNode.ValueRef.Segment.SerialNumber;
             }
 
-            while (nextSn.HasValue && !TransportClosed)
+            try
             {
-                bool needsFlush = false;
-                const int BatchSize = 32;
-
-                // NOTE (Invariant): The following inner loop holds _sndBufLock for O(snd_wnd) iterations.
-                // In a single-threaded async pump, this does not cause contention. If multi-threaded access
-                // is ever introduced, this lock duration may become a bottleneck and block concurrent HandleAck.
-                lock (_sndBufLock)
+                while (nextSn.HasValue && !TransportClosed)
                 {
-                    unacknowledged = _rcv_nxt;
-                    // If the node was removed while we released the lock (e.g. ACK received), find the next node.
-                    if (nextNode?.List == null)
-                    {
-                        nextNode = _sndBuf.Last;
-                        while (nextNode != null && TimeDiff(nextSn.Value, nextNode.ValueRef.Segment.SerialNumber) < 0)
-                        {
-                            nextNode = nextNode.Previous;
-                        }
-                        // Now nextNode is the one just before nextSn, or nextSn itself.
-                        // We actually want the node with SN >= nextSn
-                        if (nextNode == null)
-                            nextNode = _sndBuf.First;
-                        else if (TimeDiff(nextSn.Value, nextNode.ValueRef.Segment.SerialNumber) > 0)
-                            nextNode = nextNode.Next;
-                    }
+                    bool needsFlush = false;
+                    const int BatchSize = 32;
 
-                    int processed = 0;
-                    while (nextNode != null && processed < BatchSize)
+                    lock (_sndBufLock)
                     {
-                        processed++;
-                        var needsend = false;
-                        var stats = nextNode.ValueRef.Stats;
+                        unacknowledged = _rcv_nxt;
+                        // If the node was removed while we released the lock (e.g. ACK received), find the next node.
+                        if (nextNode?.List == null)
+                        {
+                            nextNode = _sndBuf.Last;
+                            while (nextNode != null && TimeDiff(nextSn.Value, nextNode.ValueRef.Segment.SerialNumber) < 0)
+                            {
+                                nextNode = nextNode.Previous;
+                            }
+                            // Now nextNode is the one just before nextSn, or nextSn itself.
+                            // We actually want the node with SN >= nextSn
+                            if (nextNode == null)
+                                nextNode = _sndBuf.First;
+                            else if (TimeDiff(nextSn.Value, nextNode.ValueRef.Segment.SerialNumber) > 0)
+                                nextNode = nextNode.Next;
+                        }
 
-                        if (stats.TransmitCount == 0)
+                        int predictedSize = size;
+                        int processed = 0;
+
+                        while (nextNode != null && processed < BatchSize)
                         {
-                            needsend = true;
-                        }
-                        else if (TimeDiff(current, stats.ResendTimestamp) >= 0)
-                        {
-                            needsend = true;
-                        }
-                        else if (stats.FastAck > resent)
-                        {
-                            if (stats.TransmitCount <= _fastlimit || _fastlimit == 0)
+                            processed++;
+                            var needsend = false;
+                            var stats = nextNode.ValueRef.Stats;
+
+                            if (stats.TransmitCount == 0)
                             {
                                 needsend = true;
                             }
-                        }
-
-                        if (needsend)
-                        {
-                            var data = nextNode.ValueRef.Data;
-                            var need = packetHeaderSize + data.Length;
-
-                            if (size + need > sizeLimitBeforePostBuffer)
-                            {
-                                needsFlush = true;
-                                nextSn = nextNode.ValueRef.Segment.SerialNumber;
-                                break;
-                            }
-
-                            // It fits! We can now commit the stats changes safely
-                            if (stats.TransmitCount == 0)
-                            {
-                                nextNode.ValueRef.Stats = new KcpSendSegmentStats(current + stats.Rto + rtomin,
-                                    _rx_rto, stats.FastAck, stats.TransmitCount + 1);
-                            }
                             else if (TimeDiff(current, stats.ResendTimestamp) >= 0)
                             {
-                                var rto = stats.Rto;
-                                if (!_nodelay)
-                                {
-                                    rto += Math.Max(stats.Rto, _rx_rto);
-                                }
-                                else
-                                {
-                                    var step = rto; //_nodelay < 2 ? segment.rto : _rx_rto;
-                                    rto += step / 2;
-                                }
-
-                                nextNode.ValueRef.Stats = new KcpSendSegmentStats(current + rto, rto, stats.FastAck, stats.TransmitCount + 1);
-                                KcpMetrics.RetransmissionCount.Add(1);
-                                lost = true;
+                                needsend = true;
                             }
                             else if (stats.FastAck > resent)
                             {
-                                nextNode.ValueRef.Stats = new KcpSendSegmentStats(current, stats.Rto, 0, stats.TransmitCount + 1);
-                                KcpMetrics.FastRetransmissionCount.Add(1);
-                                change = true;
+                                if (stats.TransmitCount <= _fastlimit || _fastlimit == 0)
+                                {
+                                    needsend = true;
+                                }
                             }
 
-                            var header = DuplicateHeader(ref nextNode.ValueRef.Segment, current, windowSize, unacknowledged);
-                            header.EncodeHeader(_id, data.Length, buffer.Span.Slice(size), out var bytesWritten);
-                            size += bytesWritten;
-
-                            if (data.Length > 0)
+                            if (needsend)
                             {
-                                data.DataRegion.CopyTo(buffer.Slice(size));
-                                size += data.Length;
+                                var data = nextNode.ValueRef.Data;
+                                var need = packetHeaderSize + data.Length;
+
+                                if (predictedSize + need > sizeLimitBeforePostBuffer)
+                                {
+                                    needsFlush = true;
+                                    nextSn = nextNode.ValueRef.Segment.SerialNumber;
+                                    break;
+                                }
+
+                                bool incrementRetransmission = false;
+                                bool incrementFastRetransmission = false;
+
+                                // It fits! We can now commit the stats changes safely
+                                if (stats.TransmitCount == 0)
+                                {
+                                    nextNode.ValueRef.Stats = new KcpSendSegmentStats(current + stats.Rto + rtomin,
+                                        _rx_rto, stats.FastAck, stats.TransmitCount + 1);
+                                }
+                                else if (TimeDiff(current, stats.ResendTimestamp) >= 0)
+                                {
+                                    var rto = stats.Rto;
+                                    if (!_nodelay)
+                                    {
+                                        rto += Math.Max(stats.Rto, _rx_rto);
+                                    }
+                                    else
+                                    {
+                                        var step = rto; //_nodelay < 2 ? segment.rto : _rx_rto;
+                                        rto += step / 2;
+                                    }
+
+                                    nextNode.ValueRef.Stats = new KcpSendSegmentStats(current + rto, rto, stats.FastAck, stats.TransmitCount + 1);
+                                    incrementRetransmission = true;
+                                    lost = true;
+                                }
+                                else if (stats.FastAck > resent)
+                                {
+                                    nextNode.ValueRef.Stats = new KcpSendSegmentStats(current, stats.Rto, 0, stats.TransmitCount + 1);
+                                    incrementFastRetransmission = true;
+                                    change = true;
+                                }
+
+                                var header = DuplicateHeader(ref nextNode.ValueRef.Segment, current, windowSize, unacknowledged);
+
+                                // Process metrics inside the lock logic
+                                if (incrementRetransmission) KcpMetrics.RetransmissionCount.Add(1);
+                                if (incrementFastRetransmission) KcpMetrics.FastRetransmissionCount.Add(1);
+
+                                // Encode and copy INSIDE the lock to avoid Use-After-Free if HandleAck concurrently releases `data` buffer.
+                                header.EncodeHeader(_id, data.Length, buffer.Span.Slice(size), out var bytesWritten);
+                                size += bytesWritten;
+
+                                if (data.Length > 0)
+                                {
+                                    data.DataRegion.CopyTo(buffer.Slice(size));
+                                    size += data.Length;
+                                }
+                            }
+
+                            nextNode = nextNode.Next;
+                        }
+
+                        if (!needsFlush)
+                        {
+                            if (nextNode != null)
+                            {
+                                nextSn = nextNode.ValueRef.Segment.SerialNumber;
+                            }
+                            else
+                            {
+                                nextSn = null; // Finished processing all nodes
                             }
                         }
+                    } // Unlock
 
-                        nextNode = nextNode.Next;
-                    }
-
-                    if (!needsFlush)
+                    // 2. Flush asynchronously outside the lock
+                    if (needsFlush)
                     {
-                        if (nextNode != null)
-                        {
-                            nextSn = nextNode.ValueRef.Segment.SerialNumber;
-                        }
-                        else
-                        {
-                            nextSn = null; // Finished processing all nodes
-                        }
+                        buffer.Span.Slice(size, postBufferSize).Clear();
+                        if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false)) return;
+                        size = preBufferSize;
+                        buffer.Span.Slice(0, size).Clear();
+                        anyPacketSent = true;
                     }
-                } // Unlock
-
-                // 2. Flush asynchronously outside the lock
-                if (needsFlush)
-                {
-                    buffer.Span.Slice(size, postBufferSize).Clear();
-                    if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false)) return;
-                    size = preBufferSize;
-                    buffer.Span.Slice(0, size).Clear();
-                    anyPacketSent = true;
+                    else if (nextSn.HasValue)
+                    {
+                        // Yield if we still have more nodes to process in the next batch
+                        await Task.Yield();
+                    }
                 }
-                else if (nextSn.HasValue)
-                {
-                    // Yield if we still have more nodes to process in the next batch
-                    await Task.Yield();
-                }
+            }
+            finally
+            {
             }
 
             unacknowledged = _rcv_nxt;
@@ -1011,6 +1035,50 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private void RunUpdateOnActivation()
     {
         _updateLoopTask = Task.Run(RunUpdateOnActivationCore_Wrapped);
+        _flushLoopTask = Task.Run(RunFlushLoopCore_Wrapped);
+    }
+
+    private async Task RunFlushLoopCore_Wrapped()
+    {
+        try
+        {
+            await RunFlushLoopCore().ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected shutdown
+        }
+        catch (Exception ex)
+        {
+            try { HandleFlushException(ex); } catch { SetTransportClosed(); }
+        }
+    }
+
+    private async Task RunFlushLoopCore()
+    {
+        var cancellationToken = _updateLoopCts?.Token ?? new CancellationToken(true);
+        var reader = _flushSignalChannel.Reader;
+
+        while (await reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            while (reader.TryRead(out _))
+            {
+                if (TransportClosed) return;
+
+                try
+                {
+                    await FlushCoreAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    if (!HandleFlushException(ex)) break;
+                }
+            }
+        }
     }
 
     private async Task RunUpdateOnActivationCore_Wrapped()
@@ -1112,7 +1180,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
     }
 
-    private async ValueTask UpdateCoreAsync(CancellationToken cancellationToken, uint current)
+    private ValueTask UpdateCoreAsync(CancellationToken cancellationToken, uint current)
     {
         int slap = TimeDiff(current, _ts_flush);
         if (slap > 10000 || slap < -10000)
@@ -1125,15 +1193,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         {
             _ts_flush += _interval;
             if (TimeDiff(current, _ts_flush) >= 0) _ts_flush = current + _interval;
-            try
-            {
-                await FlushCoreAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                HandleFlushException(ex);
-            }
+            _flushSignalChannel.Writer.TryWrite(true);
         }
+
+        return default;
     }
 
     private bool HandleFlushException(Exception ex)
@@ -1976,6 +2039,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             updateLoopCts.Cancel();
             updateLoopCts.Dispose();
         }
+        _flushSignalChannel?.Writer.TryComplete();
 
         _sendQueue.SetTransportClosed();
         _receiveQueue.SetTransportClosed();
@@ -2015,11 +2079,25 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
         SetTransportClosed();
 
-        try { _updateLoopTask?.Wait(2000); } catch { }
+        // Start background tear down to avoid blocking synchronous Dispose.
+        // Waiting synchronously in Dispose causes thread-pool starvation.
+        _ = DisposeBackgroundTasksAsync();
+    }
 
-        _sendQueue.Dispose();
-        _receiveQueue.Dispose();
-        _flushSemaphore.Dispose();
-        _cachedFlushBuffer.Dispose();
+    private async Task DisposeBackgroundTasksAsync()
+    {
+        try
+        {
+            if (_updateLoopTask != null)
+                await Task.WhenAny(_updateLoopTask, Task.Delay(2000)).ConfigureAwait(false);
+            if (_flushLoopTask != null)
+                await Task.WhenAny(_flushLoopTask, Task.Delay(2000)).ConfigureAwait(false);
+        }
+        catch { }
+
+        try { _sendQueue.Dispose(); } catch { }
+        try { _receiveQueue.Dispose(); } catch { }
+        try { _flushSemaphore.Dispose(); } catch { }
+        try { _cachedFlushBuffer.Dispose(); } catch { }
     }
 }
