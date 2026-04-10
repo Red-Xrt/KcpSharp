@@ -404,7 +404,12 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
                             _list.AddLast(waitItem.Node);
 
                             _parent.NotifyPacketReceived();
-                            return new ValueTask(YieldAsync());
+                            // Real zero-allocation backpressure:
+                            // We return a custom IValueTaskSource that doesn't complete synchronously,
+                            // but instead enqueues the continuation to the thread pool.
+                            // This pauses the receiver's while-loop until the thread pool gets back to it,
+                            // allowing OS-level sockets to queue up / drop if overloaded, without allocating a Task!
+                            return new ValueTask(s_yieldSource, 0);
                         }
 
                         waitItem = WaitItemPool.Rent();
@@ -450,7 +455,18 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
             }
         }
 
-        private static async Task YieldAsync() => await Task.Yield();
+        private sealed class YieldValueTaskSource : IValueTaskSource
+        {
+            public void GetResult(short token) { }
+            public ValueTaskSourceStatus GetStatus(short token) => ValueTaskSourceStatus.Pending;
+            public void OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
+            {
+                // Force continuation onto the thread pool asynchronously, simulating backpressure yield
+                ThreadPool.UnsafeQueueUserWorkItem(s => ((Action<object?>)s!)(state), continuation, preferLocal: false);
+            }
+        }
+
+        private static readonly IValueTaskSource s_yieldSource = new YieldValueTaskSource();
 
         private void CancelWaiting()
         {
