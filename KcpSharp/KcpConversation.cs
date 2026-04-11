@@ -59,9 +59,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private readonly KcpSendQueue _sendQueue;
     private readonly KcpReceiveQueue _receiveQueue;
 
-    private readonly LinkedList<KcpSendReceiveBufferItem> _sndBuf = new();
-    private readonly Dictionary<uint, LinkedListNode<KcpSendReceiveBufferItem>> _sndBufMap;
-        private KcpSendReceiveBufferItemCacheUnsafe _sndCache = KcpSendReceiveBufferItemCacheUnsafe.Create();
+    private readonly KcpSendReceiveBufferItem[] _sndBufArray;
 
     private readonly LinkedList<KcpSendReceiveBufferItem> _rcvBuf = new();
         private KcpSendReceiveBufferItemCacheUnsafe _rcvCache = KcpSendReceiveBufferItemCacheUnsafe.Create();
@@ -201,11 +199,20 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         _nocwnd = options is not null && options.DisableCongestionControl;
         StreamMode = options is not null && options.StreamMode;
 
-        _sndBufMap = new Dictionary<uint, LinkedListNode<KcpSendReceiveBufferItem>>((int)_snd_wnd);
+        int sndBufCapacity = 16;
+        while (sndBufCapacity < _snd_wnd + 256)
+        {
+            sndBufCapacity *= 2;
+        }
+        _sndBufArray = new KcpSendReceiveBufferItem[sndBufCapacity];
+        // Initialize the array elements' IsEmpty fields to true to denote "empty slot"
+        for (int i = 0; i < sndBufCapacity; i++)
+        {
+            _sndBufArray[i].IsEmpty = true;
+        }
 
         _cachedAckSnapshotArray = new (uint, uint)[_rcv_wnd > 0 ? _rcv_wnd : 128];
         _cachedDequeueBufferArray = new (KcpBuffer, byte)[256];
-        _cachedNodeArray = new LinkedListNode<KcpSendReceiveBufferItem>[256];
 
         _flushSignalChannel = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
         {
@@ -655,7 +662,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             {
                 int batchSize = Math.Min(availableSlots, 256);
                 var dequeueBufferArray = _cachedDequeueBufferArray;
-                var nodeArray = _cachedNodeArray;
 
                 var dequeuedCount = _sendQueue.TryDequeueBatch(dequeueBufferArray.AsSpan(0, batchSize), batchSize);
                 int processedCount = 0;
@@ -663,12 +669,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 try
                 {
                     if (dequeuedCount == 0) break;
-
-                    // Pre-allocate nodes outside the lock
-                    for (int i = 0; i < dequeuedCount; i++)
-                    {
-                        nodeArray[i] = _sndCache.Allocate(default);
-                    }
 
                     lock (_sndBufLock)
                     {
@@ -681,19 +681,18 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         {
                             var (data, fragment) = dequeueBufferArray[i];
                             uint currentSn = _snd_nxt++;
+                            int index = (int)(currentSn % (uint)_sndBufArray.Length);
 
-                            var item = new KcpSendReceiveBufferItem
+                            // The slot must be empty
+                            // If it's not, we have a serious issue (window size exceeded capacity).
+                            _sndBufArray[index] = new KcpSendReceiveBufferItem
                             {
                                 Data = data,
                                 Segment = new KcpPacketHeader(KcpCommand.Push, fragment, windowSize, current, currentSn, unacknowledged),
-                                Stats = new KcpSendSegmentStats(current, _rx_rto, 0, 0)
+                                Stats = new KcpSendSegmentStats(current, _rx_rto, 0, 0),
+                                IsEmpty = false
                             };
 
-                            var newNode = nodeArray[i];
-                            newNode.ValueRef = item;
-
-                            _sndBuf.AddLast(newNode);
-                            _sndBufMap[currentSn] = newNode;
                             processedCount++;
                         }
                     }
@@ -706,13 +705,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         for (int j = processedCount; j < dequeuedCount; j++)
                         {
                             dequeueBufferArray[j].Data.Release();
-                            _sndCache.Return(nodeArray[j]);
                         }
                     }
 
                     // Clear references so memory can be GC'd when done
                     Array.Clear(dequeueBufferArray, 0, dequeuedCount);
-                    Array.Clear(nodeArray, 0, dequeuedCount);
                 }
 
                 if (dequeuedCount < batchSize) break;
@@ -730,51 +727,47 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             var lost = false;
             var change = false;
 
-            LinkedListNode<KcpSendReceiveBufferItem>? nextNode = null;
             uint? nextSn = null;
 
             unacknowledged = _rcv_nxt;
 
             lock (_sndBufLock)
             {
-                nextNode = _sndBuf.First;
-                if (nextNode != null)
-                    nextSn = nextNode.ValueRef.Segment.SerialNumber;
+                nextSn = _snd_una;
             }
 
             try
             {
-                while (nextSn.HasValue && !TransportClosed)
+                long flushStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                long flushBudgetTicks = TimeSpan.FromMilliseconds(2).Ticks; // 2ms budget before yielding
+
+                while (nextSn.HasValue && TimeDiff(nextSn.Value, _snd_nxt) < 0 && !TransportClosed)
                 {
                     bool needsFlush = false;
-                    const int BatchSize = 32;
+                    const int BatchSize = 64;
 
                     lock (_sndBufLock)
                     {
                         unacknowledged = _rcv_nxt;
-                        // If the node was removed while we released the lock (e.g. ACK received), find the next node.
-                        if (nextNode?.List == null)
-                        {
-                            nextNode = _sndBuf.Last;
-                            while (nextNode != null && TimeDiff(nextSn.Value, nextNode.ValueRef.Segment.SerialNumber) < 0)
-                            {
-                                nextNode = nextNode.Previous;
-                            }
-                            // Now nextNode is the one just before nextSn, or nextSn itself.
-                            // We actually want the node with SN >= nextSn
-                            if (nextNode == null)
-                                nextNode = _sndBuf.First;
-                            else if (TimeDiff(nextSn.Value, nextNode.ValueRef.Segment.SerialNumber) > 0)
-                                nextNode = nextNode.Next;
-                        }
-
                         int processed = 0;
 
-                        while (nextNode != null && processed < BatchSize)
+                        while (nextSn.HasValue && TimeDiff(nextSn.Value, _snd_nxt) < 0 && processed < BatchSize)
                         {
+                            uint sn = nextSn.Value;
+                            int index = (int)(sn % (uint)_sndBufArray.Length);
+                            ref var item = ref _sndBufArray[index];
+
+                            // Check if this slot is currently occupied and matches the expected serial number
+                            if (item.IsEmpty || item.Segment.SerialNumber != sn)
+                            {
+                                // Slot empty or belongs to a different sequence (already ACKed and not replaced, or old)
+                                nextSn = sn + 1;
+                                continue;
+                            }
+
                             processed++;
                             var needsend = false;
-                            var stats = nextNode.ValueRef.Stats;
+                            ref var stats = ref item.Stats;
 
                             if (stats.TransmitCount == 0)
                             {
@@ -794,14 +787,13 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
                             if (needsend)
                             {
-                                var data = nextNode.ValueRef.Data;
+                                var data = item.Data;
                                 var need = packetHeaderSize + data.Length;
 
                                 if (size + need > sizeLimitBeforePostBuffer)
                                 {
                                     needsFlush = true;
-                                    nextSn = nextNode.ValueRef.Segment.SerialNumber;
-                                    break;
+                                    break; // keep nextSn at the current value to retry on next loop
                                 }
 
                                 bool incrementRetransmission = false;
@@ -810,7 +802,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                                 // It fits! We can now commit the stats changes safely
                                 if (stats.TransmitCount == 0)
                                 {
-                                    nextNode.ValueRef.Stats = new KcpSendSegmentStats(current + stats.Rto + rtomin,
+                                    stats = new KcpSendSegmentStats(current + stats.Rto + rtomin,
                                         _rx_rto, stats.FastAck, stats.TransmitCount + 1);
                                 }
                                 else if (TimeDiff(current, stats.ResendTimestamp) >= 0)
@@ -826,18 +818,18 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                                         rto += step / 2;
                                     }
 
-                                    nextNode.ValueRef.Stats = new KcpSendSegmentStats(current + rto, rto, stats.FastAck, stats.TransmitCount + 1);
+                                    stats = new KcpSendSegmentStats(current + rto, rto, stats.FastAck, stats.TransmitCount + 1);
                                     incrementRetransmission = true;
                                     lost = true;
                                 }
                                 else if (stats.FastAck > resent)
                                 {
-                                    nextNode.ValueRef.Stats = new KcpSendSegmentStats(current, stats.Rto, 0, stats.TransmitCount + 1);
+                                    stats = new KcpSendSegmentStats(current, stats.Rto, 0, stats.TransmitCount + 1);
                                     incrementFastRetransmission = true;
                                     change = true;
                                 }
 
-                                var header = DuplicateHeader(ref nextNode.ValueRef.Segment, current, windowSize, unacknowledged);
+                                var header = DuplicateHeader(ref item.Segment, current, windowSize, unacknowledged);
 
                                 // Process metrics inside the lock logic
                                 if (incrementRetransmission) KcpMetrics.RetransmissionCount.Add(1);
@@ -854,35 +846,39 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                                 }
                             }
 
-                            nextNode = nextNode.Next;
+                            nextSn = sn + 1;
                         }
 
-                        if (!needsFlush)
+                        if (!needsFlush && (!nextSn.HasValue || TimeDiff(nextSn.Value, _snd_nxt) >= 0))
                         {
-                            if (nextNode != null)
-                            {
-                                nextSn = nextNode.ValueRef.Segment.SerialNumber;
-                            }
-                            else
-                            {
-                                nextSn = null; // Finished processing all nodes
-                            }
+                            nextSn = null; // Finished processing all unacknowledged items
                         }
                     } // Unlock
 
                     // 2. Flush asynchronously outside the lock
                     if (needsFlush)
                     {
-                        buffer.Span.Slice(size, postBufferSize).Clear();
+                        if (postBufferSize > 0)
+                        {
+                            buffer.Span.Slice(size, postBufferSize).Clear();
+                        }
                         if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false)) return;
                         size = preBufferSize;
-                        buffer.Span.Slice(0, size).Clear();
+                        if (preBufferSize > 0)
+                        {
+                            buffer.Span.Slice(0, size).Clear();
+                        }
                         anyPacketSent = true;
                     }
                     else if (nextSn.HasValue)
                     {
-                        // Yield if we still have more nodes to process in the next batch
-                        await Task.Yield();
+                        // Yield if we still have more nodes to process in the next batch,
+                        // but only if we have exhausted our time budget.
+                        if (System.Diagnostics.Stopwatch.GetTimestamp() - flushStartTicks >= flushBudgetTicks)
+                        {
+                            await Task.Yield();
+                            flushStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                        }
                     }
                 }
             }
@@ -1528,25 +1524,22 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         long totalBytesFreed = 0;
         lock (_sndBufLock)
         {
-            while (_sndBuf.First is not null)
+            while (TimeDiff(una, _snd_una) > 0 && TimeDiff(_snd_una, _snd_nxt) < 0)
             {
-                var node = _sndBuf.First;
-                if (TimeDiff(una, node.ValueRef.Segment.SerialNumber) > 0)
+                uint sn = _snd_una;
+                int index = (int)(sn % (uint)_sndBufArray.Length);
+                ref var item = ref _sndBufArray[index];
+
+                if (!item.IsEmpty && item.Segment.SerialNumber == sn)
                 {
-                    var sn = node.ValueRef.Segment.SerialNumber;
-                    ref var dataRef = ref node.ValueRef.Data;
-                    totalBytesFreed += dataRef.Length;
-                    dataRef.Release();
-                    dataRef = default;
-                    _sndBuf.RemoveFirst();
-                    _sndBufMap.Remove(sn);
-                    _sndCache.Return(node);
+                    totalBytesFreed += item.Data.Length;
+                    item.Data.Release();
+                    item.Data = default;
+                    item.IsEmpty = true; // mark as empty
                     mutated = true;
                 }
-                else
-                {
-                    break;
-                }
+
+                _snd_una++;
             }
         }
 
@@ -1560,8 +1553,17 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     {
         lock (_sndBufLock)
         {
-            var first = _sndBuf.First;
-            var snd_una = first is null ? _snd_nxt : first.ValueRef.Segment.SerialNumber;
+            var snd_una = _snd_una;
+
+            while (TimeDiff(snd_una, _snd_nxt) < 0)
+            {
+                int index = (int)(snd_una % (uint)_sndBufArray.Length);
+                if (!_sndBufArray[index].IsEmpty && _sndBufArray[index].Segment.SerialNumber == snd_una)
+                {
+                    break;
+                }
+                snd_una++;
+            }
 
             var old_snd_una = _snd_una;
             if (old_snd_una != snd_una)
@@ -1606,19 +1608,18 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         lock (_sndBufLock)
         {
-            if (!_sndBufMap.TryGetValue(serialNumber, out var node))
+            int index = (int)(serialNumber % (uint)_sndBufArray.Length);
+            ref var item = ref _sndBufArray[index];
+
+            if (item.IsEmpty || item.Segment.SerialNumber != serialNumber)
             {
                 return false;
             }
 
-            _sndBuf.Remove(node);
-            _sndBufMap.Remove(serialNumber);
-
-            ref var dataRef = ref node.ValueRef.Data;
-            bytesFreed = dataRef.Length;
-            dataRef.Release();
-            dataRef = default;
-            _sndCache.Return(node);
+            bytesFreed = item.Data.Length;
+            item.Data.Release();
+            item.Data = default;
+            item.IsEmpty = true; // mark empty
             return true;
         }
     }
@@ -1789,8 +1790,9 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         lock (_sndBufLock)
         {
             var resent = (uint)_fastresend;
+            int index = (int)(serialNumber % (uint)_sndBufArray.Length);
 
-            if (!_sndBufMap.TryGetValue(serialNumber, out var targetNode))
+            if (_sndBufArray[index].IsEmpty || _sndBufArray[index].Segment.SerialNumber != serialNumber)
             {
                 return;
             }
@@ -1800,19 +1802,23 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             int scanLimit = _fastresend * 2;
             int scanned = 0;
 
-            LinkedListNode<KcpSendReceiveBufferItem>? node = targetNode.Previous;
+            uint prevSn = serialNumber - 1;
 
-            while (node != null && scanned < scanLimit)
+            while (TimeDiff(prevSn, _snd_una) >= 0 && scanned < scanLimit)
             {
-                if (TimeDiff(node.ValueRef.Segment.SerialNumber, _snd_una) < 0) break;
+                int prevIndex = (int)(prevSn % (uint)_sndBufArray.Length);
+                ref var item = ref _sndBufArray[prevIndex];
 
-                ref var stats = ref node.ValueRef.Stats;
-                if (stats.FastAck <= resent)
+                if (!item.IsEmpty && item.Segment.SerialNumber == prevSn)
                 {
-                    stats = new KcpSendSegmentStats(stats.ResendTimestamp, stats.Rto, stats.FastAck + 1,
-                        stats.TransmitCount);
+                    ref var stats = ref item.Stats;
+                    if (stats.FastAck <= resent)
+                    {
+                        stats = new KcpSendSegmentStats(stats.ResendTimestamp, stats.Rto, stats.FastAck + 1,
+                            stats.TransmitCount);
+                    }
                 }
-                node = node.Previous;
+                prevSn--;
                 scanned++;
             }
         }
@@ -2028,15 +2034,14 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         lock (_sndBufLock)
         {
-            while (_sndBuf.First is not null)
+            for (int i = 0; i < _sndBufArray.Length; i++)
             {
-                var node = _sndBuf.First;
-                _sndBuf.RemoveFirst();
-                node.ValueRef.Data.Release();
-                node.ValueRef = default;
-                _sndCache.Return(node);
+                if (!_sndBufArray[i].IsEmpty)
+                {
+                    _sndBufArray[i].Data.Release();
+                    _sndBufArray[i].IsEmpty = true;
+                }
             }
-            _sndBufMap.Clear();
         }
 
         lock (_rcvBufLock)
