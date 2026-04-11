@@ -51,4 +51,11 @@ public static class KcpMetrics
     public static readonly Counter<long> AckQueueOverflow = Meter.CreateCounter<long>(
         "kcp.ack_queue_overflow.count",
         description: "Number of ACKs skipped due to full buffer.");
+
+    /// <summary>
+    ///     The counter for the number of packets dropped due to WaitList overflow.
+    /// </summary>
+    public static readonly Counter<long> WaitListPacketsDropped = Meter.CreateCounter<long>(
+        "kcp.waitlist_packets_dropped.count",
+        description: "Number of KCP packets dropped due to WaitList overflow.");
 }

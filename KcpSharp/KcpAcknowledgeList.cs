@@ -112,20 +112,6 @@ internal sealed class KcpAcknowledgeList
     {
         lock (_lock)
         {
-            if (_count > 0)
-            {
-                // Deduplicate ACKs by searching backwards up to 256 elements to catch reordered duplicates
-                int limit = Math.Min(_count, (int)Math.Min(_maxCapacity, 256));
-                for (int i = 1; i <= limit; i++)
-                {
-                    int index = (_tail - i + _array.Length) % _array.Length;
-                    if (_array[index].SerialNumber == serialNumber)
-                    {
-                        return; // Duplicate found, ignore
-                    }
-                }
-            }
-
             if (_count >= _maxCapacity) return;
             EnsureCapacity();
             _array[_tail] = (serialNumber, timestamp);

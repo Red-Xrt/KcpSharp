@@ -389,27 +389,11 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
                         const int MaxQueuedPackets = 256;
                         if (_list is not null && _list.Count >= MaxQueuedPackets)
                         {
-                            // Backpressure WITHOUT dropping:
-                            // We construct a WaitItem but we DO NOT complete its Task synchronously.
-                            // However, WaitItem doesn't natively support "blocking" the caller until space frees up,
-                            // because it's meant to pass the packet *to* the consumer.
-                            // To actually block the receiver, we should return an uncompleted ValueTask.
-                            // Since implementing a generic async producer/consumer queue here is risky,
-                            // we will use Task.Yield() to throttle the receive loop *and* keep the packet in the queue.
-                            // We allow the queue to exceed 256 temporarily to avoid dropping, but we return Yield to backpressure.
-
-                            waitItem = WaitItemPool.Rent();
-                            waitItem.Initialize(this, packet, ownerAsMemoryOwner, cancellationToken);
-                            _list ??= new LinkedList<WaitItem>();
-                            _list.AddLast(waitItem.Node);
-
-                            _parent.NotifyPacketReceived();
-                            // Real zero-allocation backpressure:
-                            // We return a custom IValueTaskSource that doesn't complete synchronously,
-                            // but instead enqueues the continuation to the thread pool.
-                            // This pauses the receiver's while-loop until the thread pool gets back to it,
-                            // allowing OS-level sockets to queue up / drop if overloaded, without allocating a Task!
-                            return new ValueTask(s_yieldSource, 0);
+                            // Backpressure WITH dropping:
+                            // Drop the newest packet. This is correct UDP semantics.
+                            KcpMetrics.WaitListPacketsDropped.Add(1);
+                            bufferOwner?.Dispose();
+                            return default;
                         }
 
                         waitItem = WaitItemPool.Rent();
@@ -454,19 +438,6 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
                 throw;
             }
         }
-
-        private sealed class YieldValueTaskSource : IValueTaskSource
-        {
-            public void GetResult(short token) { }
-            public ValueTaskSourceStatus GetStatus(short token) => ValueTaskSourceStatus.Pending;
-            public void OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags)
-            {
-                // Force continuation onto the thread pool asynchronously, simulating backpressure yield
-                ThreadPool.UnsafeQueueUserWorkItem(s => ((Action<object?>)s!)(state), continuation, preferLocal: false);
-            }
-        }
-
-        private static readonly IValueTaskSource s_yieldSource = new YieldValueTaskSource();
 
         private void CancelWaiting()
         {
