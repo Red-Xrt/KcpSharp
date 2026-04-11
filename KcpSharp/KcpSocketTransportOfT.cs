@@ -584,6 +584,13 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
     private async Task RunReceiveLoopLinuxAsync()
     {
+        // Hop off the threadpool to run a blocking recvmmsg loop.
+        // This is safe because RunReceiveLoopLinuxAsync is called in a fire-and-forget Task.Run
+        // from Start(), but since we are doing Socket.Poll which blocks, we should ensure
+        // we yield control first, or explicitly request a LongRunning thread if desired.
+        // Task.Yield() ensures we hop onto a clean thread-pool thread to become a dedicated receiver.
+        await Task.Yield();
+
         var cancellationToken = _cts?.Token ?? new CancellationToken(true);
         IKcpConversation? connection = _connection;
         if (connection is null || cancellationToken.IsCancellationRequested) return;
@@ -602,9 +609,6 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         }
 
         IPEndPoint? cachedEndpoint = null;
-        SocketAddress cachedAddress = new SocketAddress(_socket.AddressFamily);
-        byte[] peekBuffer = new byte[1];
-
         ValueTask[] tasks = new ValueTask[maxBatchSize];
         SocketAddress[] socketAddressesPool = new SocketAddress[maxBatchSize];
         for (int i = 0; i < maxBatchSize; i++)
@@ -614,23 +618,27 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
         try
         {
-            int sockfd = (int)_socket.Handle;
+            int sockfd = _socket.Handle.ToInt32();
 
             while (!cancellationToken.IsCancellationRequested)
             {
-                // We use Socket.ReceiveFromAsync with 1 byte Peek to wait asynchronously
-                // without busy-spinning CPU or completely blocking thread pool,
+                // We use Socket.Poll to wait synchronously without busy-spinning CPU,
                 // waiting until at least one packet is fully available in kernel buffer.
+                // 10,000 microseconds = 10 ms. If no data, the loop continues and checks cancellationToken.
                 try
                 {
-                    await _socket.ReceiveFromAsync(peekBuffer, SocketFlags.Peek, cachedAddress, cancellationToken).ConfigureAwait(false);
+                    bool dataAvailable = _socket.Poll(10000, SelectMode.SelectRead);
+                    if (!dataAvailable)
+                    {
+                        continue;
+                    }
                 }
-                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset || ex.SocketErrorCode == SocketError.MessageSize)
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
                 {
-                    // MessageSize is expected if we peek 1 byte of a larger datagram. It means data is ready!
-                    // ConnectionReset can be ignored.
+                    // Ignore connection resets from ICMP unreachable messages
+                    continue;
                 }
-                catch (OperationCanceledException)
+                catch (ObjectDisposedException)
                 {
                     break;
                 }
