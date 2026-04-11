@@ -17,6 +17,7 @@ public static class KcpCore
     /// <param name="conversationId">The unique conversation ID, if any.</param>
     /// <param name="options">Configuration options for the KCP conversation.</param>
     /// <returns>The KCP conversation instance.</returns>
+    [Obsolete("Use KcpBuilder instead")]
     public static KcpConversation CreateConversation(
         IPEndPoint localEndPoint,
         IPEndPoint remoteEndPoint,

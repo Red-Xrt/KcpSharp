@@ -14,9 +14,10 @@ A huge thank you to the original creators and maintainers of the KCP protocol ([
 
 KcpSharp has been extensively refactored to deliver extreme performance characteristics:
 
-1. **Zero-Allocation Hot Paths:** We utilize pooled memory via pinned `GC.AllocateUninitializedArray` and `System.Threading.Channels`. Once your server is warm, sending and receiving packets generates almost *zero* garbage. 🧹
-2. **Lock-Free & Spin-Lock Concurrency:** Heavy `lock` statements in critical paths (like ACK processing) have been replaced with atomic operations and `SpinLock`, guaranteeing thread-safety without expensive context switching. ⏱️
-3. **Task/ValueTask Optimization:** We use `IValueTaskSource` and `ManualResetValueTaskSourceCore` heavily to eliminate `Task` allocations during high-frequency network loops. ⚡
+1. **Decoupled Dual-Loop Pipeline:** The CPU-bound packet ingestion loop is completely decoupled from the I/O-bound socket flush loop via a bounded `Channel<bool>`. This eliminates Head-of-Line blocking and prevents network jitter from stalling your application's receive rate.
+2. **Zero-Allocation Backpressure:** We natively backoff the socket via `Task.Yield()` when the receive queue is full, forcing the OS to absorb traffic spikes without allocating GC-heavy Timers or silently dropping application packets.
+3. **Lock-Free Capacity Reservations:** `SemaphoreSlim` bottlenecks have been replaced with a custom lock-free `AsyncCapacityReserve` primitive, completely eliminating thread contention when concurrently requesting memory slots for large stream payloads.
+4. **Task/ValueTask Optimization:** We use `IValueTaskSource` and `ManualResetValueTaskSourceCore` heavily to eliminate `Task` allocations during high-frequency network loops. ⚡
 
 ## ⚡ Quick Start
 
@@ -35,21 +36,10 @@ public class PureKcpExample
 {
     public static async Task RunAsync()
     {
-        // ==============================================================
-        // 1. SOCKET & TRANSPORT
-        // ==============================================================
-        var udpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        udpSocket.Bind(new IPEndPoint(IPAddress.Any, 0));
         var remoteEndPoint = new IPEndPoint(IPAddress.Parse("127.0.0.1"), 9999);
         
-        var transport = KcpSocketTransport.CreateConversationTransport(
-            udpSocket, 
-            remoteEndPoint, 
-            mtu: 1400
-        );
-
         // ==============================================================
-        // 2. CONFIGURE KCP CORE
+        // 1. CONFIGURE KCP OPTIONS
         // ==============================================================
         var options = new KcpConversationOptions
         {
@@ -62,8 +52,18 @@ public class PureKcpExample
             FastResend = 2,            // Skip count needed to trigger an immediate retransmission (Recommend: 2).
             DisableCongestionControl = true // If true, turns off TCP-like backoff, keeping throughput high during packet loss.
         };
-        
-        await using var conversation = new KcpConversation(transport, options);
+
+        // ==============================================================
+        // 2. USE THE FLUENT BUILDER (Auto-creates optimized Socket)
+        // ==============================================================
+        await using IKcpConversation conversation = KcpBuilder.ForConversation()
+            .WithRemoteEndPoint(remoteEndPoint)
+            .WithUdpSocket(AddressFamily.InterNetwork, out Socket udpSocket)
+            .WithOptions(options)
+            .Build();
+
+        // Bind the auto-generated UDP socket
+        udpSocket.Bind(new IPEndPoint(IPAddress.Any, 0));
 
         Console.WriteLine("KCP ready!");
 
