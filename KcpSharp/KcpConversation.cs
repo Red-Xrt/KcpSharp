@@ -60,7 +60,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private readonly KcpReceiveQueue _receiveQueue;
 
     private readonly LinkedList<KcpSendReceiveBufferItem> _sndBuf = new();
-    private readonly Dictionary<uint, LinkedListNode<KcpSendReceiveBufferItem>> _sndBufMap = new();
+    private readonly Dictionary<uint, LinkedListNode<KcpSendReceiveBufferItem>> _sndBufMap;
         private KcpSendReceiveBufferItemCacheUnsafe _sndCache = KcpSendReceiveBufferItemCacheUnsafe.Create();
 
     private readonly LinkedList<KcpSendReceiveBufferItem> _rcvBuf = new();
@@ -90,6 +90,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private Task? _flushLoopTask;
 
     private KcpRentedBuffer _cachedFlushBuffer;
+    private KcpRentedBuffer _cachedAckFlushBuffer;
     private (uint SerialNumber, uint Timestamp)[] _cachedAckSnapshotArray = Array.Empty<(uint, uint)>();
     private (KcpBuffer Data, byte Fragment)[] _cachedDequeueBufferArray = Array.Empty<(KcpBuffer, byte)>();
     private LinkedListNode<KcpSendReceiveBufferItem>[] _cachedNodeArray = Array.Empty<LinkedListNode<KcpSendReceiveBufferItem>>();
@@ -200,6 +201,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         _nocwnd = options is not null && options.DisableCongestionControl;
         StreamMode = options is not null && options.StreamMode;
 
+        _sndBufMap = new Dictionary<uint, LinkedListNode<KcpSendReceiveBufferItem>>((int)_snd_wnd);
+
         _cachedAckSnapshotArray = new (uint, uint)[_rcv_wnd > 0 ? _rcv_wnd : 128];
         _cachedDequeueBufferArray = new (KcpBuffer, byte)[256];
         _cachedNodeArray = new LinkedListNode<KcpSendReceiveBufferItem>[256];
@@ -211,7 +214,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             SingleWriter = false
         });
 
-        _updateActivation = new KcpConversationUpdateActivation((int)_interval);
+        int maxWaitListSize = Math.Max((int)_rcv_wnd, 256);
+        _updateActivation = new KcpConversationUpdateActivation((int)_interval, maxWaitListSize);
         _sendQueueItemCache = new KcpSendReceiveQueueItemCacheUnsafe();
         _receiveQueueItemCache = new KcpSendReceiveQueueItemCacheUnsafe();
         _sendQueue = new KcpSendQueue(_bufferPool, _updateActivation, StreamMode,
@@ -246,6 +250,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
 
         _cachedFlushBuffer = _bufferPool.Rent(new KcpBufferPoolRentOptions(_mtu, true));
+        _cachedAckFlushBuffer = _bufferPool.Rent(new KcpBufferPoolRentOptions(_mtu, true));
 
         try
         {
@@ -254,6 +259,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         catch
         {
             _cachedFlushBuffer.Dispose();
+            _cachedAckFlushBuffer.Dispose();
             _updateLoopCts?.Dispose();
             _sendQueue?.Dispose();
             _receiveQueue?.Dispose();
@@ -564,10 +570,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         var windowSize = (ushort)GetUnusedReceiveWindow();
         var unacknowledged = _rcv_nxt;
 
-        // Allocate a separate small buffer array to flush ACKs without holding _flushSemaphore
-        // Max MTU is typically <= 65535, so renting a single MTU buffer is cheap and prevents contention.
-        using var fastAckBuffer = _bufferPool.Rent(new KcpBufferPoolRentOptions(_mtu, true));
-        var buffer = fastAckBuffer.Memory;
+        // Use the dedicated pre-allocated buffer to flush ACKs without holding _flushSemaphore
+        var buffer = _cachedAckFlushBuffer.Memory;
 
         var size = preBufferSize;
         if (preBufferSize > 0)
@@ -1030,16 +1034,36 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             if (_keepAliveEnabled)
                 if ((uint)TimeDiff(current, _lastSendTick) > _keepAliveInterval)
                 {
+                    if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
+                    {
+                        if (postBufferSize > 0)
+                        {
+                            buffer.Span.Slice(size, postBufferSize).Clear();
+                        }
+                        if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false)) return;
+                        size = preBufferSize;
+                        if (preBufferSize > 0)
+                        {
+                            buffer.Span.Slice(0, size).Clear();
+                        }
+                    }
+
                     windowSize = (ushort)GetUnusedReceiveWindow();
                     KcpPacketHeader header = new(KcpCommand.WindowSize, 0, windowSize, 0, 0, unacknowledged);
                     header.EncodeHeader(_id, 0, buffer.Span.Slice(size), out var bytesWritten);
                     size += bytesWritten;
-                    buffer.Span.Slice(size, postBufferSize).Clear();
+                    if (postBufferSize > 0)
+                    {
+                        buffer.Span.Slice(size, postBufferSize).Clear();
+                    }
                     if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false)) return;
                     if (batch is not null)
                         await batch.FlushBatchAsync(cancellationToken).ConfigureAwait(false);
                     size = preBufferSize;
-                    buffer.Span.Slice(0, size).Clear();
+                    if (preBufferSize > 0)
+                    {
+                        buffer.Span.Slice(0, size).Clear();
+                    }
                 }
 
         }
@@ -1167,11 +1191,13 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         var activation = _updateActivation;
         if (activation is null) return;
 
-        int consecutiveSyncLoops = 0;
         while (!cancellationToken.IsCancellationRequested)
         {
             var anyUpdate = false;
             var current = GetTimestamp();
+
+            long drainStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+            long drainBudgetTicks = TimeSpan.FromMilliseconds(2).Ticks;
 
             while (true)
             {
@@ -1179,13 +1205,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 KcpConversationUpdateNotification notification;
                 if (!waitTask.IsCompletedSuccessfully)
                 {
-                    consecutiveSyncLoops = 0;
                     notification = await waitTask.ConfigureAwait(false);
                 }
                 else
                 {
                     notification = waitTask.Result;
-                    consecutiveSyncLoops++;
                 }
 
                 using (notification)
@@ -1219,6 +1243,13 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 }
 
                 if (!activation.HasPendingPackets) break;
+
+                // Yield if we have exhausted our time budget draining pending packets
+                if (System.Diagnostics.Stopwatch.GetTimestamp() - drainStartTicks >= drainBudgetTicks)
+                {
+                    await Task.Yield();
+                    drainStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                }
             }
 
             try
@@ -1752,11 +1783,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
     private void HandleFastAck(uint serialNumber, uint timestamp)
     {
+        if (_fastresend <= 0) return; // FastAck disabled
         if (TimeDiff(serialNumber, _snd_una) < 0 || TimeDiff(serialNumber, _snd_nxt) >= 0) return;
 
         lock (_sndBufLock)
         {
-            var resent = _fastresend > 0 ? (uint)_fastresend : 0xffffffff;
+            var resent = (uint)_fastresend;
 
             if (!_sndBufMap.TryGetValue(serialNumber, out var targetNode))
             {
@@ -1765,7 +1797,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
             // Apply FastAck going backwards
             // Limit the scan backwards to fastresend * 2 nodes to avoid O(N) scan across entire window
-            int scanLimit = _fastresend > 0 ? _fastresend * 2 : 10;
+            int scanLimit = _fastresend * 2;
             int scanned = 0;
 
             LinkedListNode<KcpSendReceiveBufferItem>? node = targetNode.Previous;
@@ -2050,5 +2082,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         try { _flushSemaphore.Dispose(); } catch { }
         try { _cachedFlushBuffer.Dispose(); } catch { }
+        try { _cachedAckFlushBuffer.Dispose(); } catch { }
     }
 }

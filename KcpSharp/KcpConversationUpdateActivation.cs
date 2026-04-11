@@ -19,11 +19,11 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
 
     internal System.Threading.Lock SyncRoot => _syncRoot;
 
-    public KcpConversationUpdateActivation(int interval)
+    public KcpConversationUpdateActivation(int interval, int maxWaitListSize)
     {
         _mrvtsc = new ManualResetValueTaskSourceCore<KcpConversationUpdateNotification>
             { RunContinuationsAsynchronously = true };
-        _waitList = new WaitList(this);
+        _waitList = new WaitList(this, maxWaitListSize);
 
         KcpGlobalTickEngine.Register(this, interval);
     }
@@ -226,10 +226,12 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
         private ReadOnlyMemory<byte> _packet;
         private System.Buffers.IMemoryOwner<byte>? _bufferOwner;
         private bool _signaled;
+        private readonly int _maxQueuedPackets;
 
-        public WaitList(KcpConversationUpdateActivation parent)
+        public WaitList(KcpConversationUpdateActivation parent, int maxQueuedPackets)
         {
             _parent = parent;
+            _maxQueuedPackets = maxQueuedPackets;
             _mrvtsc = new ManualResetValueTaskSourceCore<bool> { RunContinuationsAsynchronously = true };
         }
 
@@ -386,8 +388,7 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
 
                     if (_available)
                     {
-                        const int MaxQueuedPackets = 256;
-                        if (_list is not null && _list.Count >= MaxQueuedPackets)
+                        if (_list is not null && _list.Count >= _maxQueuedPackets)
                         {
                             // Backpressure WITH dropping:
                             // Drop the newest packet. This is correct UDP semantics.

@@ -603,6 +603,14 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
         IPEndPoint? cachedEndpoint = null;
         SocketAddress cachedAddress = new SocketAddress(_socket.AddressFamily);
+        byte[] peekBuffer = new byte[1];
+
+        ValueTask[] tasks = new ValueTask[maxBatchSize];
+        SocketAddress[] socketAddressesPool = new SocketAddress[maxBatchSize];
+        for (int i = 0; i < maxBatchSize; i++)
+        {
+            socketAddressesPool[i] = new SocketAddress(_socket.AddressFamily, 128); // Max typical size
+        }
 
         try
         {
@@ -610,16 +618,17 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
             while (!cancellationToken.IsCancellationRequested)
             {
-                // To avoid completely blocking the threadpool on recv, we can perform a 0-byte read or select.
-                // However, recvmmsg doesn't have an async version in .NET. Wait for data using the Socket:
-                // We use Socket.ReceiveFromAsync with 0 byte just to wait for the next packet.
+                // We use Socket.ReceiveFromAsync with 1 byte Peek to wait asynchronously
+                // without busy-spinning CPU or completely blocking thread pool,
+                // waiting until at least one packet is fully available in kernel buffer.
                 try
                 {
-                    await _socket.ReceiveFromAsync(Memory<byte>.Empty, SocketFlags.Peek, cachedAddress, cancellationToken).ConfigureAwait(false);
+                    await _socket.ReceiveFromAsync(peekBuffer, SocketFlags.Peek, cachedAddress, cancellationToken).ConfigureAwait(false);
                 }
                 catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset || ex.SocketErrorCode == SocketError.MessageSize)
                 {
-                    // Ignore and let recvmmsg clear it or we peek 0 bytes on some platforms
+                    // MessageSize is expected if we peek 1 byte of a larger datagram. It means data is ready!
+                    // ConnectionReset can be ignored.
                 }
                 catch (OperationCanceledException)
                 {
@@ -634,7 +643,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                 if (cancellationToken.IsCancellationRequested) break;
 
                 int ret = 0;
-                ValueTask[] tasks = Array.Empty<ValueTask>();
+                int taskCount = 0;
+
                 unsafe
                 {
                     fixed (byte* pAddrStr = addressBuffer)
@@ -657,18 +667,16 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                             pMsgvec[i].msg_hdr.msg_flags = 0;
                         }
 
-                        ret = KcpSocketTransportNative.recvmmsg(sockfd, pMsgvec, (uint)maxBatchSize, 0, null);
+                        // MSG_WAITFORONE = 0x10000 -> Block until at least 1 packet is ready
+                        ret = KcpSocketTransportNative.recvmmsg(sockfd, pMsgvec, (uint)maxBatchSize, 0x10000, null);
                         if (ret < 0)
                         {
                             int error = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
-                            if (error == 4 /* EINTR */ || error == 11 /* EAGAIN */) continue;
+                            if (error == 4 /* EINTR */ || error == 11 /* EAGAIN */ || error == 14 /* EWOULDBLOCK */) continue;
 
                             if (error == 104 /* ECONNRESET */) continue;
                             throw new SocketException(error);
                         }
-
-                        tasks = new ValueTask[ret];
-                        int taskCount = 0;
 
                         for (int i = 0; i < ret; i++)
                         {
@@ -681,7 +689,9 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                             int addrLen = (int)pMsgvec[i].msg_hdr.msg_namelen;
                             byte* pAddr = pAddrStr + (i * 128);
 
-                            SocketAddress receivedAddress = new SocketAddress(_socket.AddressFamily, addrLen);
+                            SocketAddress receivedAddress = socketAddressesPool[i];
+                            // Update size if it changed (though SocketAddress Size is internal/initonly in some frameworks,
+                            // we just overwrite the existing bytes up to addrLen and use it)
                             for (int j = 0; j < addrLen; j++)
                             {
                                 receivedAddress[j] = pAddr[j];
@@ -741,18 +751,14 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                                 tasks[taskCount++] = inputTask;
                             }
                         }
-
-                        if (taskCount < ret)
-                        {
-                            Array.Resize(ref tasks, taskCount);
-                        }
                     }
                 }
 
                 // Await tasks outside of the unsafe block
-                for (int i = 0; i < tasks.Length; i++)
+                for (int i = 0; i < taskCount; i++)
                 {
                     await AwaitAndDisposeAsync(tasks[i]).ConfigureAwait(false);
+                    tasks[i] = default; // clear
                 }
             }
         }
