@@ -423,49 +423,15 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         if (cancellationToken.IsCancellationRequested) return false;
 
         var mss = _mss;
-        int streamExpandBytes = 0;
         int originalBufferLength = buffer.Length;
+        int reservedSlots = originalBufferLength <= mss ? 1 : (originalBufferLength + mss - 1) / mss;
 
-        if (_stream)
-        {
-            lock (_syncRoot)
-            {
-                var node = _queue.Last;
-                if (node is not null)
-                {
-                    var data = node.ValueRef.Data;
-                    var expand = mss - data.Length;
-                    expand = Math.Min(expand, originalBufferLength);
-                    if (expand > 0)
-                    {
-                        streamExpandBytes = expand;
-                    }
-                }
-
-                if (streamExpandBytes > 0)
-                {
-                    if (originalBufferLength == streamExpandBytes)
-                    {
-                        // Completely fits into the last node, no need to wait for a semaphore
-                        ref var dataRef = ref node!.ValueRef.Data;
-                        dataRef = dataRef.AppendData(buffer.Span.Slice(0, streamExpandBytes));
-                        Interlocked.Add(ref _unflushedBytes, streamExpandBytes);
-                        _updateActivation.Notify();
-                        return true;
-                    }
-                }
-            }
-        }
-
-        var remainingLength = originalBufferLength - streamExpandBytes;
-        var count = remainingLength <= mss ? 1 : (remainingLength + mss - 1) / mss;
-
-        if (!_stream && count > 256)
+        if (!_stream && reservedSlots > 256)
             throw new ArgumentException("Message is too large (requires > 256 fragments).", nameof(buffer));
 
         try
         {
-            await _spaceSemaphore.WaitAsync(count, cancellationToken).ConfigureAwait(false);
+            await _spaceSemaphore.WaitAsync(reservedSlots, cancellationToken).ConfigureAwait(false);
         }
         catch (ObjectDisposedException)
         {
@@ -474,9 +440,12 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
         if (_transportClosed || _disposed)
         {
-            try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
+            try { _spaceSemaphore.Release(reservedSlots); } catch (ObjectDisposedException) { }
             return false;
         }
+
+        int usedSlots = 0;
+        bool anySegmentAdded = false;
 
         try
         {
@@ -484,60 +453,58 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             {
                 if (_transportClosed || _disposed)
                 {
-                    try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
+                    // The finally block handles semaphore release
                     return false;
                 }
 
-                while (count > 0)
+                if (_stream)
                 {
-
-                    if (streamExpandBytes > 0)
+                    var node = _queue.Last;
+                    if (node is not null)
                     {
-                        var node = _queue.Last;
-                        if (node is not null)
+                        ref var dataRef = ref node.ValueRef.Data;
+                        var expand = mss - dataRef.Length;
+                        expand = Math.Min(expand, buffer.Length);
+                        if (expand > 0)
                         {
-                            ref var dataRef = ref node.ValueRef.Data;
-                            dataRef = dataRef.AppendData(buffer.Span.Slice(0, streamExpandBytes));
-                            buffer = buffer.Slice(streamExpandBytes);
-                            Interlocked.Add(ref _unflushedBytes, streamExpandBytes);
+                            dataRef = dataRef.AppendData(buffer.Span.Slice(0, expand));
+                            buffer = buffer.Slice(expand);
+                            Interlocked.Add(ref _unflushedBytes, expand);
+                            anySegmentAdded = true;
                         }
-                        streamExpandBytes = 0;
                     }
+                }
 
-                    var fragment = --count;
-                    var size = buffer.Length > mss ? mss : buffer.Length;
+                int fragmentsNeeded = buffer.Length <= mss ? 1 : (buffer.Length + mss - 1) / mss;
+                int remainingFragments = fragmentsNeeded;
+                int currentFragmentIndex = fragmentsNeeded - 1; // Count down for fragments
+
+                while (remainingFragments > 0)
+                {
+                    int size = buffer.Length > mss ? mss : buffer.Length;
                     var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
                     var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Span.Slice(0, size));
                     buffer = buffer.Slice(size);
 
-                    _queue.AddLast(_cache.Rent(kcpBuffer, _stream ? (byte)0 : (byte)fragment));
+                    _queue.AddLast(_cache.Rent(kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex));
                     Interlocked.Add(ref _unflushedBytes, size);
-                }
-                    Interlocked.Add(ref _unflushedBytes, size);
+                    usedSlots++;
+                    currentFragmentIndex--;
+                    remainingFragments--;
+                    anySegmentAdded = true;
                 }
             }
         }
-        catch
+        finally
         {
-            try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
-            throw;
-        }
-                }
-            }
-        }
-        catch
-        {
-            try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
-            throw;
-        }
-            catch
+            int unusedSlots = reservedSlots - usedSlots;
+            if (unusedSlots > 0)
             {
-                try { _spaceSemaphore.Release(1); } catch (ObjectDisposedException) { }
-                throw;
+                try { _spaceSemaphore.Release(unusedSlots); } catch (ObjectDisposedException) { }
             }
         }
 
-        _updateActivation.Notify();
+        if (anySegmentAdded) _updateActivation.Notify();
         return true;
     }
 
@@ -549,45 +516,15 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             cancellationToken.ThrowIfCancellationRequested();
 
         var mss = _mss;
-        int streamExpandBytes = 0;
         int originalBufferLength = buffer.Length;
+        int reservedSlots = originalBufferLength <= mss ? 1 : (originalBufferLength + mss - 1) / mss;
 
-        if (_stream)
-        {
-            lock (_syncRoot)
-            {
-                var node = _queue.Last;
-                if (node is not null)
-                {
-                    var data = node.ValueRef.Data;
-                    var expand = mss - data.Length;
-                    expand = Math.Min(expand, originalBufferLength);
-                    if (expand > 0)
-                    {
-                        streamExpandBytes = expand;
-                    }
-                }
-
-                if (streamExpandBytes > 0)
-                {
-                    if (originalBufferLength == streamExpandBytes)
-                    {
-                        ref var dataRef = ref node!.ValueRef.Data;
-                        dataRef = dataRef.AppendData(buffer.Span.Slice(0, streamExpandBytes));
-                        Interlocked.Add(ref _unflushedBytes, streamExpandBytes);
-                        _updateActivation.Notify();
-                        return;
-                    }
-                }
-            }
-        }
-
-        var remainingLength = originalBufferLength - streamExpandBytes;
-        var count = remainingLength <= mss ? 1 : (remainingLength + mss - 1) / mss;
+        if (!_stream && reservedSlots > 256)
+            throw new ArgumentException("Message is too large (requires > 256 fragments).", nameof(buffer));
 
         try
         {
-            await _spaceSemaphore.WaitAsync(count, cancellationToken).ConfigureAwait(false);
+            await _spaceSemaphore.WaitAsync(reservedSlots, cancellationToken).ConfigureAwait(false);
         }
         catch (ObjectDisposedException)
         {
@@ -596,9 +533,12 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
         if (_transportClosed || _disposed)
         {
-            try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
+            try { _spaceSemaphore.Release(reservedSlots); } catch (ObjectDisposedException) { }
             throw new InvalidOperationException("Transport closed.");
         }
+
+        int usedSlots = 0;
+        bool anySegmentAdded = false;
 
         try
         {
@@ -606,62 +546,61 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             {
                 if (_transportClosed || _disposed)
                 {
-                    try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
+                    // The finally block handles semaphore release
                     throw new InvalidOperationException("Transport closed.");
                 }
 
-                while (count > 0)
+                if (_stream)
                 {
-
-                    if (streamExpandBytes > 0)
+                    var node = _queue.Last;
+                    if (node is not null)
                     {
-                        var node = _queue.Last;
-                        if (node is not null)
+                        ref var dataRef = ref node.ValueRef.Data;
+                        var expand = mss - dataRef.Length;
+                        expand = Math.Min(expand, buffer.Length);
+                        if (expand > 0)
                         {
-                            ref var dataRef = ref node.ValueRef.Data;
-                    count--;
-                }
-            }
-        }
-        catch
-        {
-            try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
-            throw;
-        }
-                            buffer = buffer.Slice(streamExpandBytes);
-                            Interlocked.Add(ref _unflushedBytes, streamExpandBytes);
+                            dataRef = dataRef.AppendData(buffer.Span.Slice(0, expand));
+                            buffer = buffer.Slice(expand);
+                            Interlocked.Add(ref _unflushedBytes, expand);
+                            anySegmentAdded = true;
                         }
-                        streamExpandBytes = 0;
                     }
-
-                    var size = buffer.Length > mss ? mss : buffer.Length;
-                    var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
                 }
-            }
-        }
-        catch
-        {
-            try { _spaceSemaphore.Release(count); } catch (ObjectDisposedException) { }
-            throw;
-        }
+
+                int fragmentsNeeded = buffer.Length <= mss ? 1 : (buffer.Length + mss - 1) / mss;
+                int remainingFragments = fragmentsNeeded;
+                int currentFragmentIndex = fragmentsNeeded - 1; // Count down for fragments
+
+                while (remainingFragments > 0)
+                {
+                    int size = buffer.Length > mss ? mss : buffer.Length;
+                    var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
                     var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Span.Slice(0, size));
                     buffer = buffer.Slice(size);
 
-                    _queue.AddLast(_cache.Rent(kcpBuffer, 0));
+                    _queue.AddLast(_cache.Rent(kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex));
                     Interlocked.Add(ref _unflushedBytes, size);
-                    count--;
+                    usedSlots++;
+                    currentFragmentIndex--;
+                    remainingFragments--;
+                    anySegmentAdded = true;
                 }
             }
-            catch
+        }
+        finally
+        {
+            int unusedSlots = reservedSlots - usedSlots;
+            if (unusedSlots > 0)
             {
-                try { _spaceSemaphore.Release(1); } catch (ObjectDisposedException) { }
-                throw;
+                try { _spaceSemaphore.Release(unusedSlots); } catch (ObjectDisposedException) { }
             }
         }
 
-        _updateActivation.Notify();
+        if (anySegmentAdded) _updateActivation.Notify();
     }
-public ValueTask<bool> FlushAsync(CancellationToken cancellationToken)
+
+    public ValueTask<bool> FlushAsync(CancellationToken cancellationToken)
     {
         short token;
         lock (_syncRoot)

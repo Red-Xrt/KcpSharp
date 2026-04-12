@@ -559,12 +559,18 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         int snapshotLimit = Math.Min(_ackList.Count, (int)_rcv_wnd);
         if (snapshotLimit <= 0) return false;
 
-        if (snapshotLimit > _cachedAckSnapshotArray.Length)
-            _cachedAckSnapshotArray = new (uint, uint)[snapshotLimit];
+        if (snapshotLimit < _ackList.Count)
+        {
+            KcpMetrics.AckSnapshotPartial.Add(1);
+        }
 
-        var ackSnapshotArray = _cachedAckSnapshotArray;
+        var ackSnapshotArray = System.Buffers.ArrayPool<(uint, uint)>.Shared.Rent(snapshotLimit);
         var ackCount = _ackList.SnapshotAndClear(ackSnapshotArray.AsSpan(0, snapshotLimit));
-        if (ackCount == 0) return false;
+        if (ackCount == 0)
+        {
+            System.Buffers.ArrayPool<(uint, uint)>.Shared.Return(ackSnapshotArray);
+            return false;
+        }
 
         var batch = _transport as IKcpBatchTransport;
         var preBufferSize = _preBufferSize;
@@ -595,7 +601,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 {
                     buffer.Span.Slice(size, postBufferSize).Clear();
                 }
-                if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false)) return true;
+                if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false))
+                {
+                    System.Buffers.ArrayPool<(uint, uint)>.Shared.Return(ackSnapshotArray);
+                    return true;
+                }
                 size = preBufferSize;
                 if (preBufferSize > 0)
                 {
@@ -618,6 +628,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false);
         }
 
+        System.Buffers.ArrayPool<(uint, uint)>.Shared.Return(ackSnapshotArray);
         return true;
     }
 
@@ -748,7 +759,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 while (nextSn.HasValue && TimeDiff(nextSn.Value, _snd_nxt) < 0 && !TransportClosed)
                 {
                     bool needsFlush = false;
-                    const int BatchSize = 64;
+                    const int BatchSize = 32;
 
                     lock (_sndBufLock)
                     {
