@@ -564,12 +564,13 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             KcpMetrics.AckSnapshotPartial.Add(1);
         }
 
-        if (snapshotLimit > _cachedAckSnapshotArray.Length)
-            _cachedAckSnapshotArray = new (uint, uint)[snapshotLimit];
-
-        var ackSnapshotArray = _cachedAckSnapshotArray;
+        var ackSnapshotArray = System.Buffers.ArrayPool<(uint, uint)>.Shared.Rent(snapshotLimit);
         var ackCount = _ackList.SnapshotAndClear(ackSnapshotArray.AsSpan(0, snapshotLimit));
-        if (ackCount == 0) return false;
+        if (ackCount == 0)
+        {
+            System.Buffers.ArrayPool<(uint, uint)>.Shared.Return(ackSnapshotArray);
+            return false;
+        }
 
         var batch = _transport as IKcpBatchTransport;
         var preBufferSize = _preBufferSize;
@@ -600,7 +601,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 {
                     buffer.Span.Slice(size, postBufferSize).Clear();
                 }
-                if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false)) return true;
+                if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false))
+                {
+                    System.Buffers.ArrayPool<(uint, uint)>.Shared.Return(ackSnapshotArray);
+                    return true;
+                }
                 size = preBufferSize;
                 if (preBufferSize > 0)
                 {
@@ -623,6 +628,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false);
         }
 
+        System.Buffers.ArrayPool<(uint, uint)>.Shared.Return(ackSnapshotArray);
         return true;
     }
 
