@@ -419,7 +419,10 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         }
     }
 
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<SocketAddress, IPEndPoint> _endpointCache = new(new SocketAddressEqualityComparer());
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<SocketAddress, IPEndPoint> _endpointCache = new(new SocketAddressEqualityComparer());
+    private readonly SocketAddress[] _endpointEvictionQueue = new SocketAddress[512];
+    private int _endpointEvictionIndex;
+
 
     private sealed class SocketAddressEqualityComparer : IEqualityComparer<SocketAddress>
     {
@@ -457,124 +460,81 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     {
         // Use a single receive loop. Multiple concurrent receive loops on the same socket
         // cause out-of-order packet delivery, increasing latency and memory pressure.
-        _ = Task.Run(RunReceiveLoopAsync);
+        RunReceiveLoopAsync();
     }
 
-    private async Task RunReceiveLoopAsync()
+
+    private void RunReceiveLoopAsync()
     {
         if (OperatingSystem.IsLinux() && _socket.Handle != IntPtr.Zero)
         {
-            await RunReceiveLoopLinuxAsync().ConfigureAwait(false);
+            _ = Task.Run(RunReceiveLoopLinuxAsync);
             return;
         }
 
+        var thread = new System.Threading.Thread(RunReceiveLoopWindowsSync)
+        {
+            IsBackground = true,
+            Priority = System.Threading.ThreadPriority.AboveNormal,
+            Name = "KcpReceiveThread"
+        };
+        thread.Start();
+    }
+
+    private void RunReceiveLoopWindowsSync()
+    {
         var cancellationToken = _cts?.Token ?? new CancellationToken(true);
         IKcpConversation? connection = _connection;
         if (connection is null || cancellationToken.IsCancellationRequested) return;
 
         var remoteEndpoint = (EndPoint)new IPEndPoint(_socket.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? IPAddress.Any : IPAddress.IPv6Any, 0);
-
-        SocketAddress receivedAddress = new SocketAddress(_socket.AddressFamily);
-
         byte[] localBuffer = ArrayPool<byte>.Shared.Rent(65536);
-
-        // Cache the endpoint to avoid Gen0 GC allocation on every receive when receiving from the same remote IP
-        IPEndPoint? cachedEndpoint = null;
 
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                Memory<byte> bufferMemory = localBuffer.AsMemory(0, 65536);
+                int bytesReceived = 0;
 
                 try
                 {
-                    var bytesReceived = await _socket.ReceiveFromAsync(bufferMemory, SocketFlags.None, receivedAddress, cancellationToken).ConfigureAwait(false);
-
-                    if (bytesReceived < KcpGlobalVars.HEADER_LENGTH_WITHOUT_CONVID)
-                    {
-                        continue;
-                    }
-
-                    // We must convert the SocketAddress to an IPEndPoint, but cache it if it's the same
-                    IPEndPoint endpoint;
-                    if (cachedEndpoint != null && KcpNetworkUtils.EndPointEquals(cachedEndpoint, receivedAddress))
-                    {
-                        endpoint = cachedEndpoint;
-                    }
-                    else if (_endpointCache.TryGetValue(receivedAddress, out var epFromCache))
-                    {
-                        endpoint = epFromCache;
-                        cachedEndpoint = epFromCache;
-                    }
-                    else
-                    {
-                        var ep = remoteEndpoint.Create(receivedAddress) as IPEndPoint;
-                        if (ep is null) continue;
-                        endpoint = ep;
-                        cachedEndpoint = ep;
-
-                        if (_endpointCache.Count >= 512)
-                        {
-                            _endpointCache.Clear();
-                        }
-
-                        var clonedAddress = new SocketAddress(receivedAddress.Family, receivedAddress.Size);
-                        for (int i = 0; i < receivedAddress.Size; i++)
-                        {
-                            clonedAddress[i] = receivedAddress[i];
-                        }
-
-                        _endpointCache.TryAdd(clonedAddress, ep);
-                    }
-
-                    var packet = bufferMemory.Slice(0, bytesReceived);
-
-                    if (OnRawPacketReceived(packet, endpoint))
-                    {
-                        continue;
-                    }
-
-                    if (connection is not IKcpPacketSink sink)
-                    {
-                        continue;
-                    }
-
-                    var packetOwner = s_sharedPacketOwnerPool.Get();
-                    packetOwner.Initialize(s_sharedPacketOwnerPool, bytesReceived);
-                    packet.CopyTo(packetOwner.Memory.Slice(0, bytesReceived));
-
-                    var inputTask = sink.InputPacketAsync(packetOwner.Memory.Slice(0, bytesReceived), endpoint, packetOwner, cancellationToken);
-                    if (!inputTask.IsCompletedSuccessfully)
-                    {
-                        await AwaitAndDisposeAsync(inputTask).ConfigureAwait(false);
-                    }
+                    // Blocking receive first to wait for any data (avoids CPU spin)
+                    bytesReceived = _socket.ReceiveFrom(localBuffer, 0, 65536, SocketFlags.None, ref remoteEndpoint);
                 }
-                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset || ex.SocketErrorCode == SocketError.Interrupted)
                 {
                     continue;
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (ObjectDisposedException)
-                {
-                    break;
                 }
                 catch (Exception ex)
                 {
                     HandleExceptionWrapper(ex);
                     break;
                 }
+
+                if (cancellationToken.IsCancellationRequested) break;
+
+                // Process the first packet
+                ProcessReceivedPacket(localBuffer, bytesReceived, remoteEndpoint);
+
+                // Drain the socket buffer completely
+                while (!cancellationToken.IsCancellationRequested && _socket.Poll(0, SelectMode.SelectRead))
+                {
+                    try
+                    {
+                        bytesReceived = _socket.ReceiveFrom(localBuffer, 0, 65536, SocketFlags.None, ref remoteEndpoint);
+                        ProcessReceivedPacket(localBuffer, bytesReceived, remoteEndpoint);
+                    }
+                    catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock || ex.SocketErrorCode == SocketError.ConnectionReset || ex.SocketErrorCode == SocketError.Interrupted)
+                    {
+                        break; // Buffer is empty or reset, go back to blocking wait
+                    }
+                    catch (Exception ex)
+                    {
+                        HandleExceptionWrapper(ex);
+                        break;
+                    }
+                }
             }
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch (Exception ex)
-        {
-            HandleExceptionWrapper(ex);
         }
         finally
         {
@@ -582,7 +542,33 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         }
     }
 
-    private async Task RunReceiveLoopLinuxAsync()
+    private void ProcessReceivedPacket(byte[] buffer, int bytesReceived, EndPoint remoteEndpoint)
+    {
+        if (bytesReceived < KcpGlobalVars.HEADER_LENGTH_WITHOUT_CONVID)
+            return;
+
+        var ep = remoteEndpoint as IPEndPoint;
+        if (ep is null) return;
+
+        var packetMemory = new ReadOnlyMemory<byte>(buffer, 0, bytesReceived);
+
+        if (OnRawPacketReceived(packetMemory, ep))
+        {
+            return;
+        }
+
+        var owner = s_sharedPacketOwnerPool.Get();
+        owner.Initialize(s_sharedPacketOwnerPool, bytesReceived);
+        packetMemory.Span.CopyTo(owner.Memory.Span);
+
+        var connection = _connection;
+        if (connection != null && connection is IKcpPacketSink sink)
+        {
+            _ = AwaitAndDisposeAsync(sink.InputPacketAsync(owner.Memory.Slice(0, bytesReceived), ep, owner, default));
+        }
+    }
+
+private async Task RunReceiveLoopLinuxAsync()
     {
         // Hop off the threadpool to run a blocking recvmmsg loop.
         // This is safe because RunReceiveLoopLinuxAsync is called in a fire-and-forget Task.Run
@@ -619,6 +605,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         try
         {
             int sockfd = _socket.Handle.ToInt32();
+            int emptyPollCount = 0;
+            int currentPollTimeout = 1000; // 1ms active
 
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -627,11 +615,20 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                 // 10,000 microseconds = 10 ms. If no data, the loop continues and checks cancellationToken.
                 try
                 {
-                    bool dataAvailable = _socket.Poll(10000, SelectMode.SelectRead);
+                    bool dataAvailable = _socket.Poll(currentPollTimeout, SelectMode.SelectRead);
                     if (!dataAvailable)
                     {
+                        emptyPollCount++;
+                        if (emptyPollCount >= 10)
+                        {
+                            currentPollTimeout = 5000; // 5ms idle
+                        }
                         continue;
                     }
+
+                    // Reset back to active 1ms tier
+                    emptyPollCount = 0;
+                    currentPollTimeout = 1000;
                 }
                 catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
                 {
@@ -722,18 +719,21 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                                 endpoint = ep;
                                 cachedEndpoint = ep;
 
-                                if (_endpointCache.Count >= 512)
-                                {
-                                    _endpointCache.Clear();
-                                }
-
                                 var clonedAddress = new SocketAddress(receivedAddress.Family, receivedAddress.Size);
                                 for (int j = 0; j < receivedAddress.Size; j++)
                                 {
                                     clonedAddress[j] = receivedAddress[j];
                                 }
 
-                                _endpointCache.TryAdd(clonedAddress, ep);
+                                if (_endpointCache.TryAdd(clonedAddress, ep))
+                                {
+                                    int index = System.Threading.Interlocked.Increment(ref _endpointEvictionIndex) % 512;
+                                    var oldAddress = System.Threading.Interlocked.Exchange(ref _endpointEvictionQueue[index], clonedAddress);
+                                    if (oldAddress != null)
+                                    {
+                                        _endpointCache.TryRemove(oldAddress, out _);
+                                    }
+                                }
                             }
 
                             Memory<byte> bufferMemory = buffers[i].AsMemory(0, (int)bytesReceived);

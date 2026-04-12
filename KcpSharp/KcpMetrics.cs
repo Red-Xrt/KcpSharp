@@ -48,9 +48,9 @@ public static class KcpMetrics
     /// <summary>
     ///     The counter for the number of ACKs skipped due to full buffer.
     /// </summary>
-    public static readonly Counter<long> AckQueueOverflow = Meter.CreateCounter<long>(
-        "kcp.ack_queue_overflow.count",
-        description: "Number of ACKs skipped due to full buffer.");
+    public static readonly Counter<long> AckSnapshotPartial = Meter.CreateCounter<long>(
+        "kcp.ack_snapshot_partial.count",
+        description: "Number of times ACK snapshot was limited by destination buffer size - ACKs are queued for next flush, not lost.");
 
     /// <summary>
     ///     The counter for the number of packets dropped due to WaitList overflow.

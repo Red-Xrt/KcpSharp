@@ -559,6 +559,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         int snapshotLimit = Math.Min(_ackList.Count, (int)_rcv_wnd);
         if (snapshotLimit <= 0) return false;
 
+        if (snapshotLimit < _ackList.Count)
+        {
+            KcpMetrics.AckSnapshotPartial.Add(1);
+        }
+
         if (snapshotLimit > _cachedAckSnapshotArray.Length)
             _cachedAckSnapshotArray = new (uint, uint)[snapshotLimit];
 
@@ -748,7 +753,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 while (nextSn.HasValue && TimeDiff(nextSn.Value, _snd_nxt) < 0 && !TransportClosed)
                 {
                     bool needsFlush = false;
-                    const int BatchSize = 64;
+                    const int BatchSize = 32;
 
                     lock (_sndBufLock)
                     {
