@@ -40,6 +40,9 @@ internal static class KcpSocketTransportNative
 
     [DllImport("libc", EntryPoint = "sendmmsg", SetLastError = true)]
     internal static extern unsafe int sendmmsg(int sockfd, mmsghdr* msgvec, uint vlen, int flags);
+
+    [DllImport("libc", EntryPoint = "recvmmsg", SetLastError = true)]
+    internal static extern unsafe int recvmmsg(int sockfd, mmsghdr* msgvec, uint vlen, int flags, void* timeout);
 }
 
 /// <summary>
@@ -459,6 +462,12 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
     private async Task RunReceiveLoopAsync()
     {
+        if (OperatingSystem.IsLinux() && _socket.Handle != IntPtr.Zero)
+        {
+            await RunReceiveLoopLinuxAsync().ConfigureAwait(false);
+            return;
+        }
+
         var cancellationToken = _cts?.Token ?? new CancellationToken(true);
         IKcpConversation? connection = _connection;
         if (connection is null || cancellationToken.IsCancellationRequested) return;
@@ -570,6 +579,209 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         finally
         {
             ArrayPool<byte>.Shared.Return(localBuffer);
+        }
+    }
+
+    private async Task RunReceiveLoopLinuxAsync()
+    {
+        // Hop off the threadpool to run a blocking recvmmsg loop.
+        // This is safe because RunReceiveLoopLinuxAsync is called in a fire-and-forget Task.Run
+        // from Start(), but since we are doing Socket.Poll which blocks, we should ensure
+        // we yield control first, or explicitly request a LongRunning thread if desired.
+        // Task.Yield() ensures we hop onto a clean thread-pool thread to become a dedicated receiver.
+        await Task.Yield();
+
+        var cancellationToken = _cts?.Token ?? new CancellationToken(true);
+        IKcpConversation? connection = _connection;
+        if (connection is null || cancellationToken.IsCancellationRequested) return;
+
+        var remoteEndpoint = (EndPoint)new IPEndPoint(_socket.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? IPAddress.Any : IPAddress.IPv6Any, 0);
+        int maxBatchSize = _maxBatchSize > 0 ? _maxBatchSize : 32;
+
+        KcpSocketTransportNative.mmsghdr[] msgvecPool = ArrayPool<KcpSocketTransportNative.mmsghdr>.Shared.Rent(maxBatchSize);
+        KcpSocketTransportNative.iovec[] iovecsPool = ArrayPool<KcpSocketTransportNative.iovec>.Shared.Rent(maxBatchSize);
+        byte[] addressBuffer = ArrayPool<byte>.Shared.Rent(maxBatchSize * 128);
+        byte[][] buffers = new byte[maxBatchSize][];
+
+        for (int i = 0; i < maxBatchSize; i++)
+        {
+            buffers[i] = GC.AllocateUninitializedArray<byte>(65536, pinned: true);
+        }
+
+        IPEndPoint? cachedEndpoint = null;
+        ValueTask[] tasks = new ValueTask[maxBatchSize];
+        SocketAddress[] socketAddressesPool = new SocketAddress[maxBatchSize];
+        for (int i = 0; i < maxBatchSize; i++)
+        {
+            socketAddressesPool[i] = new SocketAddress(_socket.AddressFamily, 128); // Max typical size
+        }
+
+        try
+        {
+            int sockfd = _socket.Handle.ToInt32();
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                // We use Socket.Poll to wait synchronously without busy-spinning CPU,
+                // waiting until at least one packet is fully available in kernel buffer.
+                // 10,000 microseconds = 10 ms. If no data, the loop continues and checks cancellationToken.
+                try
+                {
+                    bool dataAvailable = _socket.Poll(10000, SelectMode.SelectRead);
+                    if (!dataAvailable)
+                    {
+                        continue;
+                    }
+                }
+                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset)
+                {
+                    // Ignore connection resets from ICMP unreachable messages
+                    continue;
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    HandleExceptionWrapper(ex);
+                    break;
+                }
+
+                if (cancellationToken.IsCancellationRequested) break;
+
+                int ret = 0;
+                int taskCount = 0;
+
+                unsafe
+                {
+                    fixed (byte* pAddrStr = addressBuffer)
+                    fixed (KcpSocketTransportNative.iovec* pIovecs = iovecsPool)
+                    fixed (KcpSocketTransportNative.mmsghdr* pMsgvec = msgvecPool)
+                    {
+                        for (int i = 0; i < maxBatchSize; i++)
+                        {
+                            ref byte firstByte = ref buffers[i][0];
+                            pIovecs[i].iov_base = System.Runtime.CompilerServices.Unsafe.AsPointer(ref firstByte);
+                            pIovecs[i].iov_len = 65536;
+
+                            byte* pAddr = pAddrStr + (i * 128);
+                            pMsgvec[i].msg_hdr.msg_name = pAddr;
+                            pMsgvec[i].msg_hdr.msg_namelen = 128;
+                            pMsgvec[i].msg_hdr.msg_iov = pIovecs + i;
+                            pMsgvec[i].msg_hdr.msg_iovlen = 1;
+                            pMsgvec[i].msg_hdr.msg_control = null;
+                            pMsgvec[i].msg_hdr.msg_controllen = 0;
+                            pMsgvec[i].msg_hdr.msg_flags = 0;
+                        }
+
+                        // MSG_WAITFORONE = 0x10000 -> Block until at least 1 packet is ready
+                        ret = KcpSocketTransportNative.recvmmsg(sockfd, pMsgvec, (uint)maxBatchSize, 0x10000, null);
+                        if (ret < 0)
+                        {
+                            int error = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                            if (error == 4 /* EINTR */ || error == 11 /* EAGAIN */ || error == 14 /* EWOULDBLOCK */) continue;
+
+                            if (error == 104 /* ECONNRESET */) continue;
+                            throw new SocketException(error);
+                        }
+
+                        for (int i = 0; i < ret; i++)
+                        {
+                            uint bytesReceived = pMsgvec[i].msg_len;
+                            if (bytesReceived < KcpGlobalVars.HEADER_LENGTH_WITHOUT_CONVID)
+                            {
+                                continue;
+                            }
+
+                            int addrLen = (int)pMsgvec[i].msg_hdr.msg_namelen;
+                            byte* pAddr = pAddrStr + (i * 128);
+
+                            SocketAddress receivedAddress = socketAddressesPool[i];
+                            // Update size if it changed (though SocketAddress Size is internal/initonly in some frameworks,
+                            // we just overwrite the existing bytes up to addrLen and use it)
+                            for (int j = 0; j < addrLen; j++)
+                            {
+                                receivedAddress[j] = pAddr[j];
+                            }
+
+                            IPEndPoint endpoint;
+                            if (cachedEndpoint != null && KcpNetworkUtils.EndPointEquals(cachedEndpoint, receivedAddress))
+                            {
+                                endpoint = cachedEndpoint;
+                            }
+                            else if (_endpointCache.TryGetValue(receivedAddress, out var epFromCache))
+                            {
+                                endpoint = epFromCache;
+                                cachedEndpoint = epFromCache;
+                            }
+                            else
+                            {
+                                var ep = remoteEndpoint.Create(receivedAddress) as IPEndPoint;
+                                if (ep is null) continue;
+                                endpoint = ep;
+                                cachedEndpoint = ep;
+
+                                if (_endpointCache.Count >= 512)
+                                {
+                                    _endpointCache.Clear();
+                                }
+
+                                var clonedAddress = new SocketAddress(receivedAddress.Family, receivedAddress.Size);
+                                for (int j = 0; j < receivedAddress.Size; j++)
+                                {
+                                    clonedAddress[j] = receivedAddress[j];
+                                }
+
+                                _endpointCache.TryAdd(clonedAddress, ep);
+                            }
+
+                            Memory<byte> bufferMemory = buffers[i].AsMemory(0, (int)bytesReceived);
+                            var packet = bufferMemory.Slice(0, (int)bytesReceived);
+
+                            if (OnRawPacketReceived(packet, endpoint))
+                            {
+                                continue;
+                            }
+
+                            if (connection is not IKcpPacketSink sink)
+                            {
+                                continue;
+                            }
+
+                            var packetOwner = s_sharedPacketOwnerPool.Get();
+                            packetOwner.Initialize(s_sharedPacketOwnerPool, (int)bytesReceived);
+                            packet.CopyTo(packetOwner.Memory.Slice(0, (int)bytesReceived));
+
+                            var inputTask = sink.InputPacketAsync(packetOwner.Memory.Slice(0, (int)bytesReceived), endpoint, packetOwner, cancellationToken);
+                            if (!inputTask.IsCompletedSuccessfully)
+                            {
+                                tasks[taskCount++] = inputTask;
+                            }
+                        }
+                    }
+                }
+
+                // Await tasks outside of the unsafe block
+                for (int i = 0; i < taskCount; i++)
+                {
+                    await AwaitAndDisposeAsync(tasks[i]).ConfigureAwait(false);
+                    tasks[i] = default; // clear
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            HandleExceptionWrapper(ex);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(addressBuffer);
+            ArrayPool<KcpSocketTransportNative.mmsghdr>.Shared.Return(msgvecPool);
+            ArrayPool<KcpSocketTransportNative.iovec>.Shared.Return(iovecsPool);
         }
     }
 

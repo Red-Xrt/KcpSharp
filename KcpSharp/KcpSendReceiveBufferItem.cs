@@ -5,4 +5,5 @@ internal struct KcpSendReceiveBufferItem
     public KcpBuffer Data;
     public KcpPacketHeader Segment;
     public KcpSendSegmentStats Stats;
+    public bool IsEmpty;
 }
