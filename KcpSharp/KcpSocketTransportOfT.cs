@@ -634,6 +634,8 @@ private async Task RunReceiveLoopLinuxAsync()
         if (connection is null || cancellationToken.IsCancellationRequested) return;
 
         var remoteEndpoint = (EndPoint)new IPEndPoint(_socket.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? IPAddress.Any : IPAddress.IPv6Any, 0);
+        // Even if send batching is disabled (_maxBatchSize == 0), we want to aggressively batch receive packets
+        // from the OS kernel buffer into managed memory to reduce recvmmsg syscalls and context switches.
         int maxBatchSize = _maxBatchSize > 0 ? _maxBatchSize : 32;
 
         KcpSocketTransportNative.mmsghdr[] msgvecPool = ArrayPool<KcpSocketTransportNative.mmsghdr>.Shared.Rent(maxBatchSize);
