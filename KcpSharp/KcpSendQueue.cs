@@ -453,6 +453,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             {
                 if (_transportClosed || _disposed)
                 {
+                    // The finally block handles semaphore release
                     return false;
                 }
 
@@ -544,6 +545,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             {
                 if (_transportClosed || _disposed)
                 {
+                    // The finally block handles semaphore release
                     throw new InvalidOperationException("Transport closed.");
                 }
 

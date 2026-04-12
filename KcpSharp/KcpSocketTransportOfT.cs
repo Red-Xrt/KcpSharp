@@ -489,6 +489,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
         var remoteEndpoint = (EndPoint)new IPEndPoint(_socket.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? IPAddress.Any : IPAddress.IPv6Any, 0);
         byte[] localBuffer = ArrayPool<byte>.Shared.Rent(65536);
+        IPEndPoint? cachedEndpoint = null;
 
         try
         {
@@ -505,6 +506,10 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                 {
                     continue;
                 }
+                catch (ObjectDisposedException)
+                {
+                    break; // Expected on exit/transport close
+                }
                 catch (Exception ex)
                 {
                     HandleExceptionWrapper(ex);
@@ -513,8 +518,12 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
                 if (cancellationToken.IsCancellationRequested) break;
 
-                // Process the first packet
-                ProcessReceivedPacket(localBuffer, bytesReceived, remoteEndpoint);
+                IPEndPoint? ep = ResolveEndpoint(remoteEndpoint, ref cachedEndpoint);
+                if (ep != null)
+                {
+                    // Process the first packet
+                    ProcessReceivedPacket(localBuffer, bytesReceived, ep);
+                }
 
                 // Drain the socket buffer completely
                 while (!cancellationToken.IsCancellationRequested && _socket.Poll(0, SelectMode.SelectRead))
@@ -522,11 +531,19 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                     try
                     {
                         bytesReceived = _socket.ReceiveFrom(localBuffer, 0, 65536, SocketFlags.None, ref remoteEndpoint);
-                        ProcessReceivedPacket(localBuffer, bytesReceived, remoteEndpoint);
+                        ep = ResolveEndpoint(remoteEndpoint, ref cachedEndpoint);
+                        if (ep != null)
+                        {
+                            ProcessReceivedPacket(localBuffer, bytesReceived, ep);
+                        }
                     }
                     catch (SocketException ex) when (ex.SocketErrorCode == SocketError.WouldBlock || ex.SocketErrorCode == SocketError.ConnectionReset || ex.SocketErrorCode == SocketError.Interrupted)
                     {
                         break; // Buffer is empty or reset, go back to blocking wait
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        break; // Expected on exit/transport close
                     }
                     catch (Exception ex)
                     {
@@ -542,13 +559,48 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         }
     }
 
-    private void ProcessReceivedPacket(byte[] buffer, int bytesReceived, EndPoint remoteEndpoint)
+    private IPEndPoint? ResolveEndpoint(EndPoint remoteEndpoint, ref IPEndPoint? cachedEndpoint)
+    {
+        var rawEp = remoteEndpoint as IPEndPoint;
+        if (rawEp is null) return null;
+
+        SocketAddress receivedAddress = remoteEndpoint.Serialize();
+
+        if (cachedEndpoint != null && KcpNetworkUtils.EndPointEquals(cachedEndpoint, receivedAddress))
+        {
+            return cachedEndpoint;
+        }
+        else if (_endpointCache.TryGetValue(receivedAddress, out var epFromCache))
+        {
+            cachedEndpoint = epFromCache;
+            return epFromCache;
+        }
+        else
+        {
+            var clonedAddress = new SocketAddress(receivedAddress.Family, receivedAddress.Size);
+            for (int j = 0; j < receivedAddress.Size; j++)
+            {
+                clonedAddress[j] = receivedAddress[j];
+            }
+
+            if (_endpointCache.TryAdd(clonedAddress, rawEp))
+            {
+                int index = (int)((uint)System.Threading.Interlocked.Increment(ref _endpointEvictionIndex) % 512);
+                var oldAddress = System.Threading.Interlocked.Exchange(ref _endpointEvictionQueue[index], clonedAddress);
+                if (oldAddress != null)
+                {
+                    _endpointCache.TryRemove(oldAddress, out _);
+                }
+            }
+            cachedEndpoint = rawEp;
+            return rawEp;
+        }
+    }
+
+    private void ProcessReceivedPacket(byte[] buffer, int bytesReceived, IPEndPoint ep)
     {
         if (bytesReceived < KcpGlobalVars.HEADER_LENGTH_WITHOUT_CONVID)
             return;
-
-        var ep = remoteEndpoint as IPEndPoint;
-        if (ep is null) return;
 
         var packetMemory = new ReadOnlyMemory<byte>(buffer, 0, bytesReceived);
 
@@ -727,7 +779,7 @@ private async Task RunReceiveLoopLinuxAsync()
 
                                 if (_endpointCache.TryAdd(clonedAddress, ep))
                                 {
-                                    int index = System.Threading.Interlocked.Increment(ref _endpointEvictionIndex) % 512;
+                                    int index = (int)((uint)System.Threading.Interlocked.Increment(ref _endpointEvictionIndex) % 512);
                                     var oldAddress = System.Threading.Interlocked.Exchange(ref _endpointEvictionQueue[index], clonedAddress);
                                     if (oldAddress != null)
                                     {
