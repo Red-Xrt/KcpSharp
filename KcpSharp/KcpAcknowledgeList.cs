@@ -44,11 +44,9 @@ internal sealed class KcpAcknowledgeList
         {
             count = Math.Min(_count, destination.Length);
 
-            int skipped = _count - count;
-            if (skipped > 0)
-            {
-                KcpMetrics.AckQueueOverflow.Add(skipped);
-            }
+            // The skipped metric was misnamed and misused as an overflow indicator.
+            // ACKs aren't lost, they're just left for the next snapshot.
+            // Removed misleading AckQueueOverflow.Add(skipped);
 
             if (count > 0)
             {
