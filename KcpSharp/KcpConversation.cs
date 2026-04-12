@@ -685,6 +685,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
                             // The slot must be empty
                             // If it's not, we have a serious issue (window size exceeded capacity).
+                            if (!_sndBufArray[index].IsEmpty)
+                            {
+                                throw new InvalidOperationException($"CRITICAL: Ring buffer aliasing detected! Overwriting unacknowledged segment. SN: {currentSn}, Index: {index}, Capacity: {_sndBufArray.Length}, SND_UNA: {_snd_una}, SND_NXT: {_snd_nxt}. Congestion window bounds exceeded.");
+                            }
                             _sndBufArray[index] = new KcpSendReceiveBufferItem
                             {
                                 Data = data,
