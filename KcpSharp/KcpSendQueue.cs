@@ -475,11 +475,11 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     }
                 }
 
-                int fragmentsNeeded = buffer.Length == 0 ? 0 : (buffer.Length <= mss ? 1 : (buffer.Length + mss - 1) / mss);
-
+                int fragmentsNeeded = buffer.Length <= mss ? 1 : (buffer.Length + mss - 1) / mss;
+                int remainingFragments = fragmentsNeeded;
                 int currentFragmentIndex = fragmentsNeeded - 1; // Count down for fragments
 
-                while (buffer.Length > 0)
+                while (remainingFragments > 0)
                 {
                     int size = buffer.Length > mss ? mss : buffer.Length;
                     var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
@@ -490,6 +490,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     Interlocked.Add(ref _unflushedBytes, size);
                     usedSlots++;
                     currentFragmentIndex--;
+                    remainingFragments--;
                     anySegmentAdded = true;
                 }
             }
@@ -567,10 +568,11 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     }
                 }
 
-                int fragmentsNeeded = buffer.Length == 0 ? 0 : (buffer.Length <= mss ? 1 : (buffer.Length + mss - 1) / mss);
+                int fragmentsNeeded = buffer.Length <= mss ? 1 : (buffer.Length + mss - 1) / mss;
+                int remainingFragments = fragmentsNeeded;
                 int currentFragmentIndex = fragmentsNeeded - 1; // Count down for fragments
 
-                while (buffer.Length > 0)
+                while (remainingFragments > 0)
                 {
                     int size = buffer.Length > mss ? mss : buffer.Length;
                     var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
@@ -581,6 +583,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     Interlocked.Add(ref _unflushedBytes, size);
                     usedSlots++;
                     currentFragmentIndex--;
+                    remainingFragments--;
                     anySegmentAdded = true;
                 }
             }

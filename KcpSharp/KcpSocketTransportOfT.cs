@@ -616,7 +616,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         var connection = _connection;
         if (connection != null && connection is IKcpPacketSink sink)
         {
-            _ = AwaitAndDisposeAsync(sink.InputPacketAsync(owner.Memory.Slice(0, bytesReceived), ep, owner, default));
+            _ = FireAndForgetInput(sink.InputPacketAsync(owner.Memory.Slice(0, bytesReceived), ep, owner, default));
         }
     }
 
@@ -817,7 +817,7 @@ private async Task RunReceiveLoopLinuxAsync()
                 // Await tasks outside of the unsafe block
                 for (int i = 0; i < taskCount; i++)
                 {
-                    await AwaitAndDisposeAsync(tasks[i]).ConfigureAwait(false);
+                    await FireAndForgetInput(tasks[i]).ConfigureAwait(false);
                     tasks[i] = default; // clear
                 }
             }
@@ -837,7 +837,7 @@ private async Task RunReceiveLoopLinuxAsync()
         }
     }
 
-    private static async ValueTask AwaitAndDisposeAsync(ValueTask task)
+    private async ValueTask FireAndForgetInput(ValueTask task)
     {
         // No need to dispose the owner here: ownership was already transferred to InputPacketAsync
         await task.ConfigureAwait(false);
