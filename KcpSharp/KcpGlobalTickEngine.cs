@@ -222,7 +222,13 @@ internal static class KcpGlobalTickEngine
                         {
                             if (s_activations.TryGetValue(activation, out var entry))
                             {
-                                if (entry.Unregistered) continue;
+                                if (entry.Unregistered)
+                                {
+                                    // If we somehow pulled an unregistered activation from the execution list
+                                    // but it's still in the dictionary, it shouldn't be added to the wheel.
+                                    s_activations.TryRemove(activation, out _);
+                                    continue;
+                                }
 
                                 if (TimeDiff(currentTickMs, entry.NextTick) >= 0)
                                 {
