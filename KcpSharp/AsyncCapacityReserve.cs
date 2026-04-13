@@ -245,11 +245,13 @@ internal sealed class AsyncCapacityReserve : IDisposable
     {
         private const int MaxPoolSize = 2048;
         private static readonly System.Collections.Concurrent.ConcurrentQueue<Waiter> s_pool = new();
+        private static int s_poolCount;
 
         public static Waiter Rent()
         {
             if (s_pool.TryDequeue(out var item))
             {
+                Interlocked.Decrement(ref s_poolCount);
                 return item;
             }
             return new Waiter();
@@ -257,8 +259,16 @@ internal sealed class AsyncCapacityReserve : IDisposable
 
         public static void Return(Waiter item)
         {
-            if (s_pool.Count >= MaxPoolSize) return;
-            s_pool.Enqueue(item);
+            while (true)
+            {
+                int currentCount = s_poolCount;
+                if (currentCount >= MaxPoolSize) return;
+                if (Interlocked.CompareExchange(ref s_poolCount, currentCount + 1, currentCount) == currentCount)
+                {
+                    s_pool.Enqueue(item);
+                    return;
+                }
+            }
         }
     }
 }

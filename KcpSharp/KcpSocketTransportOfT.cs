@@ -609,13 +609,12 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
             return;
         }
 
-        var owner = s_sharedPacketOwnerPool.Get();
-        owner.Initialize(s_sharedPacketOwnerPool, bytesReceived);
-        packetMemory.Span.CopyTo(owner.Memory.Span);
-
         var connection = _connection;
         if (connection != null && connection is IKcpPacketSink sink)
         {
+            var owner = s_sharedPacketOwnerPool.Get();
+            owner.Initialize(s_sharedPacketOwnerPool, bytesReceived);
+            packetMemory.Span.CopyTo(owner.Memory.Span);
             _ = FireAndForgetInput(sink.InputPacketAsync(owner.Memory.Slice(0, bytesReceived), ep, owner, default));
         }
     }
@@ -798,19 +797,17 @@ private async Task RunReceiveLoopLinuxAsync()
                                 continue;
                             }
 
-                            if (connection is not IKcpPacketSink sink)
+                            if (connection is IKcpPacketSink sink)
                             {
-                                continue;
-                            }
+                                var packetOwner = s_sharedPacketOwnerPool.Get();
+                                packetOwner.Initialize(s_sharedPacketOwnerPool, (int)bytesReceived);
+                                packet.CopyTo(packetOwner.Memory.Slice(0, (int)bytesReceived));
 
-                            var packetOwner = s_sharedPacketOwnerPool.Get();
-                            packetOwner.Initialize(s_sharedPacketOwnerPool, (int)bytesReceived);
-                            packet.CopyTo(packetOwner.Memory.Slice(0, (int)bytesReceived));
-
-                            var inputTask = sink.InputPacketAsync(packetOwner.Memory.Slice(0, (int)bytesReceived), endpoint, packetOwner, cancellationToken);
-                            if (!inputTask.IsCompletedSuccessfully)
-                            {
-                                tasks[taskCount++] = inputTask;
+                                var inputTask = sink.InputPacketAsync(packetOwner.Memory.Slice(0, (int)bytesReceived), endpoint, packetOwner, cancellationToken);
+                                if (!inputTask.IsCompletedSuccessfully)
+                                {
+                                    tasks[taskCount++] = inputTask;
+                                }
                             }
                         }
                     }
