@@ -247,7 +247,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
             if (cancellationToken.IsCancellationRequested)
                 return new ValueTask<bool>(Task.FromCanceled<bool>(cancellationToken));
 
-            if (CheckQueeuSize(minimumBytes, minimumSegments)) return new ValueTask<bool>(true);
+            if (CheckQueueSize(minimumBytes, minimumSegments)) return new ValueTask<bool>(true);
 
             _activeWait = true;
             Debug.Assert(!_signaled);
@@ -495,7 +495,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
                 fragment = 0;
 
                 var lastNode = _queue.Last;
-                if (lastNode is not null && lastNode.ValueRef.Data.TryAppend(buffer, out var combined))
+                if (lastNode is not null && lastNode.ValueRef.Data.TryAppend(ref buffer, out var combined))
                 {
                     // appended
                     if (lastNode.ValueRef.Fragment != 0)
@@ -637,7 +637,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
     private void TryCompleteWaitForData(ref bool executeSetResult, ref KcpConversationReceiveResult resultToSet)
     {
         if (_operationMode == 2)
-            if (CheckQueeuSize(_minimumBytes, _minimumSegments))
+            if (CheckQueueSize(_minimumBytes, _minimumSegments))
             {
                 ClearPreviousOperation(true);
                 resultToSet = new KcpConversationReceiveResult(0);
@@ -835,7 +835,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         return false;
     }
 
-    private bool CheckQueeuSize(int minimumBytes, int minimumSegments)
+    private bool CheckQueueSize(int minimumBytes, int minimumSegments)
     {
         return _totalBytesInQueue >= minimumBytes && _totalSegmentsInQueue >= minimumSegments;
     }

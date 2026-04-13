@@ -834,7 +834,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             int toRelease = _capacity - currentCount;
             if (toRelease > 0)
             {
-                try { _spaceSemaphore.Release(toRelease); } catch (ObjectDisposedException) { }
+                try { _spaceSemaphore.Release(toRelease); } catch (ObjectDisposedException) { } catch (System.Threading.SemaphoreFullException) { }
             }
         }
 

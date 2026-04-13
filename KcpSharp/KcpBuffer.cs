@@ -41,12 +41,15 @@ internal struct KcpBuffer
     /// Note: The returned combined buffer shares the same underlying memory owner as the original buffer.
     /// The caller must ensure that `Release()` is called only once for the shared ownership (e.g., call `Release()` on the combined buffer but not the original).
     /// </summary>
-    internal bool TryAppend(KcpBuffer buffer, out KcpBuffer combined)
+    internal bool TryAppend(ref KcpBuffer buffer, out KcpBuffer combined)
     {
         if (Length + buffer.Length <= _memory.Length)
         {
             buffer.DataRegion.Span.CopyTo(_memory.Span.Slice(Length));
             combined = new KcpBuffer(_owner, _memory, Length + buffer.Length);
+            // Transfer ownership conceptually by clearing the owner of the current instance
+            // We enforce single ownership by nullifying the owner in the source instance.
+            _owner = null;
             return true;
         }
 

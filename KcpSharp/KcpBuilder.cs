@@ -45,8 +45,22 @@ public sealed class KcpBuilder
     private Socket? _socket;
 
     /// <summary>
-    ///     Creates an underlying UDP Socket automatically.
+    ///     Creates an underlying UDP Socket automatically and binds it to the specified local endpoint.
     /// </summary>
+    public KcpBuilder WithUdpSocket(System.Net.IPEndPoint localEndPoint, System.Net.Sockets.AddressFamily addressFamily, out System.Net.Sockets.Socket socket)
+    {
+        socket = new System.Net.Sockets.Socket(addressFamily, System.Net.Sockets.SocketType.Dgram, System.Net.Sockets.ProtocolType.Udp);
+        if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+        {
+            const int SIO_UDP_CONNRESET = -1744830452;
+            try { socket.IOControl(SIO_UDP_CONNRESET, new byte[] { 0, 0, 0, 0 }, null); } catch { }
+        }
+        socket.Blocking = false;
+        socket.Bind(localEndPoint);
+        _socket = socket;
+        return this;
+    }
+
     public KcpBuilder WithUdpSocket(AddressFamily addressFamily, out Socket socket)
     {
         socket = new Socket(addressFamily, SocketType.Dgram, ProtocolType.Udp);
