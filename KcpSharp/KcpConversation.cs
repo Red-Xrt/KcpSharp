@@ -43,7 +43,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     /// THREADING: Only accessed from RunUpdateOnActivationCore's single-threaded loop.
     /// Do NOT access from multiple threads without synchronization.
     /// </remarks>
-    private KcpProbeType _probe;
+    private volatile int _probeFlags;
+    private volatile bool _lostDetected;
+    private volatile bool _changeDetected;
+    private volatile int _resentCount;
 
     private readonly uint _interval;
     private uint _ts_flush;
@@ -573,6 +576,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             var batch = _transport as IKcpBatchTransport;
+            var probe = (KcpProbeType)Interlocked.Exchange(ref _probeFlags, 0);
             var preBufferSize = _preBufferSize;
             var postBufferSize = _postBufferSize;
             int packetHeaderSize = _id.HasValue
@@ -644,6 +648,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             if (TransportClosed) return;
 
             var batch = _transport as IKcpBatchTransport;
+            var probe = (KcpProbeType)Interlocked.Exchange(ref _probeFlags, 0);
             var preBufferSize = _preBufferSize;
             var postBufferSize = _postBufferSize;
             int packetHeaderSize = _id.HasValue
@@ -860,6 +865,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                                     change = true;
                                 }
 
+                                windowSize = (ushort)GetUnusedReceiveWindow();
                                 var header = DuplicateHeader(ref item.Segment, current, windowSize, unacknowledged);
 
                                 // Process metrics inside the lock logic
@@ -935,7 +941,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         _probe_wait += _probe_wait / 2;
                         if (_probe_wait > IKCP_PROBE_LIMIT) _probe_wait = IKCP_PROBE_LIMIT;
                         _ts_probe = current + _probe_wait;
-                        _probe |= KcpProbeType.AskSend;
+                        Interlocked.Or(ref _probeFlags, (int)KcpProbeType.AskSend);
                     }
                 }
             }
@@ -946,7 +952,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             // flush window probing command
-            if ((_probe & KcpProbeType.AskSend) != 0)
+            if ((probe & KcpProbeType.AskSend) != 0)
             {
                 if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
                 {
@@ -964,7 +970,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             // flush window probing response
-            if ((_probe & KcpProbeType.AskTell) != 0)
+            if ((probe & KcpProbeType.AskTell) != 0)
             {
                 if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
                 {
@@ -982,7 +988,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             // periodic window notification
-            if (!anyPacketSent && ShouldSendWindowSize(current) && (_probe & KcpProbeType.AskTell) == 0)
+            if (!anyPacketSent && ShouldSendWindowSize(current) && (probe & KcpProbeType.AskTell) == 0)
             {
                 if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
                 {
@@ -1014,7 +1020,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 buffer.Span.Slice(0, size).Clear();
             }
 
-            _probe = KcpProbeType.None;
+            // _probeFlags is already cleared by Interlocked.Exchange
 
             if (batch is not null)
             {
@@ -1032,30 +1038,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             var incr = _incr;
 
             // update sshthresh
-            if (lost)
+            if (lost) _lostDetected = true;
+            if (change)
             {
-                _ssthresh = Math.Max(cwnd / 2, IKCP_THRESH_MIN);
-                updatedCwnd = 1;
-                incr = (uint)_mss;
+                Interlocked.Exchange(ref _resentCount, (int)(_fastresend > 0 ? (uint)_fastresend : 0xffffffff));
+                _changeDetected = true;
             }
-            else if (change)
-            {
-                var inflight = _snd_nxt - _snd_una;
-                _ssthresh = Math.Max(inflight / 2, IKCP_THRESH_MIN);
-                updatedCwnd = _ssthresh + resent;
-                incr = updatedCwnd * (uint)_mss;
-            }
-
-            if (updatedCwnd < 1)
-            {
-                updatedCwnd = 1;
-                incr = (uint)_mss;
-            }
-
-            if (updatedCwnd > Volatile.Read(ref _rmt_wnd)) updatedCwnd = Volatile.Read(ref _rmt_wnd);
-
-            _cwnd = updatedCwnd;
-            _incr = incr;
 
             // send keep-alive
             if (_keepAliveEnabled)
@@ -1492,7 +1480,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 }
                 else if (header.Command == KcpCommand.WindowProbe)
                 {
-                    _probe |= KcpProbeType.AskTell;
+                    Interlocked.Or(ref _probeFlags, (int)KcpProbeType.AskTell);
                 }
                 else if (header.Command == KcpCommand.WindowSize)
                 {
@@ -1512,6 +1500,23 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             if (mutated)
             {
                 mutated = UpdateSendUnacknowledged() | mutated;
+            }
+
+            if (_lostDetected)
+            {
+                _ssthresh = Math.Max(_cwnd / 2, IKCP_THRESH_MIN);
+                _cwnd = 1;
+                _incr = (uint)_mss;
+                _lostDetected = false;
+            }
+            else if (_changeDetected)
+            {
+                var inflight = _snd_nxt - _snd_una;
+                _ssthresh = Math.Max(inflight / 2, IKCP_THRESH_MIN);
+                var resent = (uint)Interlocked.Exchange(ref _resentCount, 0);
+                _cwnd = _ssthresh + resent;
+                _incr = _cwnd * (uint)_mss;
+                _changeDetected = false;
             }
 
             if (TimeDiff(_snd_una, prev_una) > 0)
@@ -1731,10 +1736,17 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                                 while (node is not null)
                                 {
                                     diff = TimeDiff(serialNumber, node.ValueRef.Segment.SerialNumber);
-                                    if (diff < 0) break;
+                                    if (diff < 0)
+                                    {
+                                        node = node.Previous;
+                                        break;
+                                    }
                                     if (diff == 0) return false;
                                     if (node.Next == null) break;
-                                    if (TimeDiff(serialNumber, node.Next.ValueRef.Segment.SerialNumber) < 0) break;
+                                    if (TimeDiff(serialNumber, node.Next.ValueRef.Segment.SerialNumber) < 0)
+                                    {
+                                        break;
+                                    }
                                     node = node.Next;
                                 }
                                 break;
@@ -2166,7 +2178,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
         catch { }
 
-        try { _flushSemaphore.Dispose(); } catch { }
+        try
+        {
+            await _flushSemaphore.WaitAsync().ConfigureAwait(false);
+            _flushSemaphore.Dispose();
+        }
+        catch { }
         try { _cachedFlushBuffer.Dispose(); } catch { }
         try { _cachedAckFlushBuffer.Dispose(); } catch { }
     }

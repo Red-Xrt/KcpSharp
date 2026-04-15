@@ -178,10 +178,15 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
             slotIndex = _batchCount;
             activeSet = _activeSet;
 
+            var sa = endpoint.Serialize();
+            if (sa.Size > 128)
+            {
+                return false;
+            }
+
             _batchEndpoints[activeSet][slotIndex] = endpoint;
             _batchSizes[activeSet][slotIndex] = requiredSize;
 
-            var sa = endpoint.Serialize();
             sa.Buffer.Span.Slice(0, sa.Size).CopyTo(_batchAddresses[activeSet][slotIndex]);
             _batchAddressLengths[activeSet][slotIndex] = sa.Size;
 
@@ -648,7 +653,6 @@ private async Task RunReceiveLoopLinuxAsync()
         }
 
         IPEndPoint? cachedEndpoint = null;
-        ValueTask[] tasks = new ValueTask[maxBatchSize];
         SocketAddress[] socketAddressesPool = new SocketAddress[maxBatchSize];
         for (int i = 0; i < maxBatchSize; i++)
         {
@@ -701,7 +705,7 @@ private async Task RunReceiveLoopLinuxAsync()
                 if (cancellationToken.IsCancellationRequested) break;
 
                 int ret = 0;
-                int taskCount = 0;
+
 
                 unsafe
                 {
@@ -806,18 +810,11 @@ private async Task RunReceiveLoopLinuxAsync()
                                 var inputTask = sink.InputPacketAsync(packetOwner.Memory.Slice(0, (int)bytesReceived), endpoint, packetOwner, cancellationToken);
                                 if (!inputTask.IsCompletedSuccessfully)
                                 {
-                                    tasks[taskCount++] = inputTask;
+                                    _ = FireAndForgetInput(inputTask);
                                 }
                             }
                         }
                     }
-                }
-
-                // Await tasks outside of the unsafe block
-                for (int i = 0; i < taskCount; i++)
-                {
-                    await FireAndForgetInput(tasks[i]).ConfigureAwait(false);
-                    tasks[i] = default; // clear
                 }
             }
         }

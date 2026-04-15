@@ -77,8 +77,18 @@ internal sealed class AsyncCapacityReserve : IDisposable
                     }
                     else
                     {
-                        // Someone else took the capacity lock-free. We wait again.
-                        break;
+                        // Retry loop logic because TryReserve failed due to a lock-free CAS race with Release/WaitAsync.
+                        // Continuing allows us to re-read _currentCount correctly instead of breaking and stalling forever.
+                        if (TryReserve(waiter.Count))
+                        {
+                            _waiters.RemoveFirst();
+                            waiter.Node = null;
+                            waiter.Complete();
+                        }
+                        else
+                        {
+                            break;
+                        }
                     }
                 }
                 else

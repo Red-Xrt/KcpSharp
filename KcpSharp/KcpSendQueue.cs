@@ -5,7 +5,7 @@ namespace KcpSharp;
 
 internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, IDisposable
 {
-    private readonly System.Threading.Lock _syncRoot = new();
+    internal readonly System.Threading.Lock SyncRoot = new();
     private readonly AsyncCapacityReserve _spaceSemaphore;
 
     private readonly IKcpBufferPool _bufferPool;
@@ -58,7 +58,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         bool executeSetResult = false;
         Exception? exceptionToSet = null;
 
-        lock (_syncRoot)
+        lock (SyncRoot)
         {
             if (_disposed) return;
             _disposed = true;
@@ -111,7 +111,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         finally
         {
             _mrvtsc.Reset();
-            lock (_syncRoot)
+            lock (SyncRoot)
             {
                 _activeWait = false;
                 _signaled = false;
@@ -141,7 +141,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         finally
         {
             _mrvtsc.Reset();
-            lock (_syncRoot)
+            lock (SyncRoot)
             {
                 _activeWait = false;
                 _signaled = false;
@@ -152,7 +152,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
     public bool TryGetAvailableSpace(out int byteCount, out int segmentCount)
     {
-        lock (_syncRoot)
+        lock (SyncRoot)
         {
             if (_transportClosed || _disposed)
             {
@@ -181,26 +181,41 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
         int count = 0;
         bool needSignal = false;
-        lock (_syncRoot)
+        lock (SyncRoot)
         {
-            while (count < maxCount && count < results.Length)
-            {
-                var node = _queue.First;
-                if (node is null) break;
-
-                results[count] = (node.ValueRef.Data, node.ValueRef.Fragment);
-                _queue.RemoveFirst();
-                node.ValueRef = default;
-                _cache.Return(node);
-                count++;
-            }
-
-            if (count > 0)
-            {
-                CheckForAvailableSpace(ref needSignal);
-            }
+            count = TryDequeueBatchUnsafe(results, maxCount, ref needSignal);
         }
 
+        PostDequeueBatch(count, needSignal);
+
+        return count;
+    }
+
+    internal int TryDequeueBatchUnsafe(Span<(KcpBuffer Data, byte Fragment)> results, int maxCount, ref bool needSignal)
+    {
+        int count = 0;
+        while (count < maxCount && count < results.Length)
+        {
+            var node = _queue.First;
+            if (node is null) break;
+
+            results[count] = (node.ValueRef.Data, node.ValueRef.Fragment);
+            _queue.RemoveFirst();
+            node.ValueRef = default;
+            _cache.Return(node);
+            count++;
+        }
+
+        if (count > 0)
+        {
+            CheckForAvailableSpace(ref needSignal);
+        }
+
+        return count;
+    }
+
+    internal void PostDequeueBatch(int count, bool needSignal)
+    {
         if (count > 0)
         {
             try
@@ -211,12 +226,14 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             {
                 // Ignore: transport is shutting down
             }
+            catch (SemaphoreFullException)
+            {
+                // Ignore
+            }
         }
 
         if (needSignal)
             _mrvtsc.SetResult(true);
-
-        return count;
     }
 
     private void GetAvailableSpaceCore(out int byteCount, out int segmentCount)
@@ -245,7 +262,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         CancellationToken cancellationToken)
     {
         short token;
-        lock (_syncRoot)
+        lock (SyncRoot)
         {
             if (_transportClosed || _disposed)
             {
@@ -286,7 +303,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
     public bool TrySend(ReadOnlySpan<byte> buffer, bool allowPartialSend, out int bytesWritten)
     {
-        lock (_syncRoot)
+        lock (SyncRoot)
         {
             if (allowPartialSend && !_stream) ThrowHelper.ThrowAllowPartialSendArgumentException();
             if (_transportClosed || _disposed)
@@ -449,7 +466,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
         try
         {
-            lock (_syncRoot)
+            lock (SyncRoot)
             {
                 if (_transportClosed || _disposed)
                 {
@@ -542,7 +559,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
         try
         {
-            lock (_syncRoot)
+            lock (SyncRoot)
             {
                 if (_transportClosed || _disposed)
                 {
@@ -603,7 +620,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
     public ValueTask<bool> FlushAsync(CancellationToken cancellationToken)
     {
         short token;
-        lock (_syncRoot)
+        lock (SyncRoot)
         {
             if (_transportClosed || _disposed) return new ValueTask<bool>(false);
             if (_activeWait)
@@ -634,7 +651,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
     public ValueTask FlushForStreamAsync(CancellationToken cancellationToken)
     {
         short token;
-        lock (_syncRoot)
+        lock (SyncRoot)
         {
             if (_transportClosed || _disposed)
                 return new ValueTask(Task.FromException(ThrowHelper.NewTransportClosedForStreamException()));
@@ -659,7 +676,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
     {
         bool executeSetException = false;
         Exception? exceptionToSet = null;
-        lock (_syncRoot)
+        lock (SyncRoot)
         {
             if (_activeWait && !_signaled)
             {
@@ -682,7 +699,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
     {
         bool executeSetException = false;
         Exception? exceptionToSet = null;
-        lock (_syncRoot)
+        lock (SyncRoot)
         {
             if (_activeWait && !_signaled)
             {
@@ -712,7 +729,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
     public void NotifyAckListChanged(bool itemsListNotEmpty)
     {
         bool executeSetResult = false;
-        lock (_syncRoot)
+        lock (SyncRoot)
         {
             if (_transportClosed || _disposed) return;
 
@@ -772,7 +789,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             }
 
             bool executeSetResult = false;
-            lock (_syncRoot)
+            lock (SyncRoot)
             {
                 TryCompleteFlush(ref executeSetResult);
             }
@@ -799,7 +816,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         bool executeSetException = false;
         bool executeSetResult = false;
         Exception? exceptionToSet = null;
-        lock (_syncRoot)
+        lock (SyncRoot)
         {
             if (_transportClosed || _disposed) return;
             if (_activeWait && !_signaled)
@@ -834,7 +851,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             int toRelease = _capacity - currentCount;
             if (toRelease > 0)
             {
-                try { _spaceSemaphore.Release(toRelease); } catch (ObjectDisposedException) { }
+                try { _spaceSemaphore.Release(toRelease); } catch (Exception) { }
             }
         }
 

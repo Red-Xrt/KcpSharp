@@ -100,8 +100,10 @@ internal sealed class KcpAcknowledgeList
             if (Interlocked.CompareExchange(ref _dequeuePos, currentEnqueuePos, currentDequeuePos) == currentDequeuePos)
             {
                 // Fix the sequences for skipped slots so writers don't hang
-                for (int pos = currentDequeuePos; pos < currentEnqueuePos; pos++)
+                int range = Math.Min(currentEnqueuePos - currentDequeuePos, _ring.Length);
+                for (int i = 0; i < range; i++)
                 {
+                    int pos = currentDequeuePos + i;
 #pragma warning disable CS0420
                     Volatile.Write(ref _ring[pos & _mask].Sequence, pos + _mask + 1);
 #pragma warning restore CS0420

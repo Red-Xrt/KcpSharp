@@ -104,6 +104,11 @@ internal static class KcpGlobalTickEngine
                     s_tickTask = Task.Run(() => TickLoopAsync(s_cts.Token));
                 }
             }
+
+            if (TimeDiff((uint)Environment.TickCount + SlotMs, entry.NextTick) >= 0)
+            {
+                activation.Notify();
+            }
         }
     }
 
