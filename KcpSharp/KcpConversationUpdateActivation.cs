@@ -19,6 +19,8 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
 
     internal System.Threading.Lock SyncRoot => _syncRoot;
 
+    internal int WaitListDepth => _waitList.ListCount;
+
     public KcpConversationUpdateActivation(int interval, int maxWaitListSize)
     {
         _mrvtsc = new ManualResetValueTaskSourceCore<KcpConversationUpdateNotification>
@@ -236,6 +238,7 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
         }
 
         internal System.Threading.Lock SyncRoot => _parent.SyncRoot;
+        internal int ListCount => _list?.Count ?? 0;
 
         public void Dispose()
         {

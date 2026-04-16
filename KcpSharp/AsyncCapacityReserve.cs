@@ -23,18 +23,29 @@ internal sealed class AsyncCapacityReserve : IDisposable
 
     public int CurrentCount => _currentCount;
 
+    private volatile int _hasWaiters;
+
     public bool TryReserve(int count)
     {
         if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
         if (count == 0) return true;
 
+        if (_hasWaiters == 1) return false;
+
+        return TryReserveInternal(count);
+    }
+
+    private bool TryReserveInternal(int count)
+    {
         while (true)
         {
             int current = _currentCount;
             if (current < count) return false;
 
             if (Interlocked.CompareExchange(ref _currentCount, current - count, current) == current)
+            {
                 return true;
+            }
         }
     }
 
@@ -69,7 +80,7 @@ internal sealed class AsyncCapacityReserve : IDisposable
                 var waiter = waiterNode.Value;
                 if (_currentCount >= waiter.Count)
                 {
-                    if (TryReserve(waiter.Count))
+                    if (TryReserveInternal(waiter.Count))
                     {
                         _waiters.RemoveFirst();
                         waiter.Node = null;
@@ -87,6 +98,8 @@ internal sealed class AsyncCapacityReserve : IDisposable
                     break;
                 }
             }
+
+            _hasWaiters = _waiters.First is not null ? 1 : 0;
         }
     }
 

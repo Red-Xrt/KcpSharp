@@ -254,8 +254,10 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         {
             if (_conversations.TryRemove(id, out var value) && ReferenceEquals(value.Conversation, addedConversation))
             {
-                // Do NOT dispose the caller's conversation here to prevent a use-after-free race.
-                // We just remove it from the dictionary.
+                // To prevent TOCTOU race condition (H-5) where Dispose completes before we reach here
+                // causing the conversation to be leaked and never disposed, we must dispose it ourselves
+                // because we just registered it into a disposed dictionary.
+                value.Conversation.Dispose();
             }
             ThrowObjectDisposedException();
         }

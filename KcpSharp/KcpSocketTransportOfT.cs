@@ -468,7 +468,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     {
         if (OperatingSystem.IsLinux() && _socket.Handle != IntPtr.Zero)
         {
-            _ = Task.Run(RunReceiveLoopLinuxAsync);
+            _ = Task.Factory.StartNew(RunReceiveLoopLinuxAsync, default, TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
             return;
         }
 

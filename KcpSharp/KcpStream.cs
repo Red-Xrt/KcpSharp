@@ -92,7 +92,7 @@ public sealed class KcpStream : Stream
                 if (_input.TryRead(out var readResult))
                 {
                     bool hasData = !readResult.Buffer.IsEmpty;
-                    _input.AdvanceTo(readResult.Buffer.Start, readResult.Buffer.Start);
+                    _input.AdvanceTo(readResult.Buffer.Start, readResult.Buffer.End);
                     return hasData;
                 }
                 return false;

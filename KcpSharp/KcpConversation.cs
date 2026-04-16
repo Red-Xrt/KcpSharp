@@ -27,6 +27,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private volatile uint _snd_una;
     private volatile uint _snd_nxt;
     private volatile uint _rcv_nxt;
+    private volatile uint _max_ack_sn;
+    private volatile int _max_ack_has_value;
 
     private uint _ssthresh;
 
@@ -60,9 +62,9 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private readonly KcpReceiveQueue _receiveQueue;
 
     private readonly KcpSendReceiveBufferItem[] _sndBufArray;
+    private readonly (KcpBuffer, byte)[] _flushDequeueBuffer;
 
-    private readonly LinkedList<KcpSendReceiveBufferItem> _rcvBuf = new();
-        private KcpSendReceiveBufferItemCacheUnsafe _rcvCache = KcpSendReceiveBufferItemCacheUnsafe.Create();
+    private readonly KcpSendReceiveBufferItem[] _rcvBufArray;
 
     private readonly KcpAcknowledgeList _ackList;
 
@@ -89,10 +91,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
     private KcpRentedBuffer _cachedFlushBuffer;
     private KcpRentedBuffer _cachedAckFlushBuffer;
-    private (uint SerialNumber, uint Timestamp)[] _cachedAckSnapshotArray = Array.Empty<(uint, uint)>();
-    private LinkedListNode<KcpSendReceiveBufferItem>[] _cachedNodeArray = Array.Empty<LinkedListNode<KcpSendReceiveBufferItem>>();
-
-    private Func<Exception, KcpConversation, object?, bool>? _exceptionHandler;
+        private Func<Exception, KcpConversation, object?, bool>? _exceptionHandler;
     private object? _exceptionHandlerState;
 
     private const uint IKCP_RTO_MAX = 60000;
@@ -197,12 +196,25 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         _fastlimit = 5;
         _nocwnd = options is not null && options.DisableCongestionControl;
         StreamMode = options is not null && options.StreamMode;
+        _flushDequeueBuffer = new (KcpBuffer, byte)[Math.Min((int)_snd_wnd, 256)];
 
         int sndBufCapacity = 16;
-        while (sndBufCapacity < _snd_wnd + 256)
+        while (sndBufCapacity < _snd_wnd)
         {
             sndBufCapacity *= 2;
         }
+
+        int rcvBufCapacity = 16;
+        while (rcvBufCapacity < _rcv_wnd)
+        {
+            rcvBufCapacity *= 2;
+        }
+        _rcvBufArray = new KcpSendReceiveBufferItem[rcvBufCapacity];
+        for (int i = 0; i < rcvBufCapacity; i++)
+        {
+            _rcvBufArray[i].IsEmpty = true;
+        }
+
         _sndBufArray = new KcpSendReceiveBufferItem[sndBufCapacity];
         // Initialize the array elements' IsEmpty fields to true to denote "empty slot"
         for (int i = 0; i < sndBufCapacity; i++)
@@ -210,7 +222,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             _sndBufArray[i].IsEmpty = true;
         }
 
-        _cachedAckSnapshotArray = new (uint, uint)[_rcv_wnd > 0 ? _rcv_wnd : 128];
 
         _flushSignalChannel = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
         {
@@ -674,8 +685,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             int availableSlots = TimeDiff(Volatile.Read(ref _snd_una) + cwnd, Volatile.Read(ref _snd_nxt));
             while (availableSlots > 0)
             {
-                int batchSize = Math.Min(availableSlots, 256);
-                var dequeueBufferArray = System.Buffers.ArrayPool<(KcpBuffer, byte)>.Shared.Rent(batchSize);
+                int batchSize = Math.Min(availableSlots, _flushDequeueBuffer.Length);
+                var dequeueBufferArray = _flushDequeueBuffer;
 
                 var dequeuedCount = _sendQueue.TryDequeueBatch(dequeueBufferArray.AsSpan(0, batchSize), batchSize);
                 int processedCount = 0;
@@ -738,9 +749,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         }
                     }
 
-                    // Clear references so memory can be GC'd when done and return to pool
+                    // Clear references so memory can be GC'd when done
                     Array.Clear(dequeueBufferArray, 0, dequeuedCount);
-                    System.Buffers.ArrayPool<(KcpBuffer, byte)>.Shared.Return(dequeueBufferArray);
                 }
 
                 if (dequeuedCount < batchSize) break;
@@ -782,6 +792,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         unacknowledged = _rcv_nxt;
                         int processed = 0;
 
+                        #pragma warning disable CS0420
+                        bool hasMaxAck = Volatile.Read(ref _max_ack_has_value) == 1;
+                        uint maxAckSn = Volatile.Read(ref _max_ack_sn);
+#pragma warning restore CS0420
+
                         while (nextSn.HasValue && TimeDiff(nextSn.Value, _snd_nxt) < 0 && processed < BatchSize)
                         {
                             uint sn = nextSn.Value;
@@ -799,6 +814,21 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                             processed++;
                             var needsend = false;
                             ref var stats = ref item.Stats;
+
+                            // Apply FastAck deferral
+                            if (hasMaxAck && TimeDiff(maxAckSn, sn) > 0)
+                            {
+                                if (stats.TransmitCount <= _fastlimit || _fastlimit == 0)
+                                {
+                                    // We use the distance from maxAck as a proxy for FastAck count,
+                                    // or just set it to the distance directly if it's larger.
+                                    uint distance = (uint)TimeDiff(maxAckSn, sn);
+                                    if (distance > stats.FastAck)
+                                    {
+                                        stats = new KcpSendSegmentStats(stats.ResendTimestamp, stats.Rto, distance, stats.TransmitCount);
+                                    }
+                                }
+                            }
 
                             if (stats.TransmitCount == 0)
                             {
@@ -1373,6 +1403,42 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 return default;
             }
 
+            bool hasPush = false;
+                        var currentSpan = packetSpan;
+            while (currentSpan.Length >= 20)
+            {
+                KcpCommand cmd = (KcpCommand)currentSpan[0];
+                int pktLength = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(currentSpan.Slice(16));
+
+                if (cmd == KcpCommand.Push)
+                {
+                    hasPush = true;
+                    break;
+                }
+
+                if (currentSpan.Length >= 20 + pktLength)
+                {
+                    currentSpan = currentSpan.Slice(20 + pktLength);
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            if (!hasPush)
+            {
+                // Pure ACK/Probe packet, process inline to avoid queue hop
+                uint current = GetTimestamp();
+                bool mutated = SetInput(packet.Span, null, current); // null because no push means no data stored
+                if (mutated)
+                {
+                    _updateActivation?.Notify();
+                }
+                bufferOwner?.Dispose();
+                return default;
+            }
+
             var activation = _updateActivation;
             if (activation is null)
             {
@@ -1507,7 +1573,22 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 packetOffset += length;
             }
 
-            if (flag) HandleFastAck(maxack, latest_ts);
+            if (flag)
+            {
+                while (true)
+                {
+                    #pragma warning disable CS0420
+                    var currentMaxAck = Volatile.Read(ref _max_ack_sn);
+                    if (Volatile.Read(ref _max_ack_has_value) == 1 && TimeDiff(maxack, currentMaxAck) <= 0) break;
+
+                    if (Interlocked.CompareExchange(ref _max_ack_sn, maxack, currentMaxAck) == currentMaxAck)
+                    {
+                        Volatile.Write(ref _max_ack_has_value, 1);
+#pragma warning restore CS0420
+                        break;
+                    }
+                }
+            }
 
             if (mutated)
             {
@@ -1660,179 +1741,66 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
     }
 
-    private LinkedListNode<KcpSendReceiveBufferItem>? _lastRcvNodeHint;
-
     private bool HandleData(KcpPacketHeader header, ReadOnlySpan<byte> data, System.Buffers.IMemoryOwner<byte>? originalBuffer, int dataOffsetInBuffer)
     {
         var serialNumber = header.SerialNumber;
         if (TimeDiff(serialNumber, _rcv_nxt + _rcv_wnd) >= 0 || TimeDiff(serialNumber, _rcv_nxt) < 0) return false;
 
         var mutated = false;
-        LinkedListNode<KcpSendReceiveBufferItem>? node;
         lock (_rcvBufLock)
         {
             if (TransportClosed) return false;
 
-            if (_lastRcvNodeHint?.List != null)
-            {
-                node = _lastRcvNodeHint;
+            int index = (int)(serialNumber % (uint)_rcvBufArray.Length);
+            ref var itemRef = ref _rcvBufArray[index];
 
-                // If the serial number is too far behind the hint, fallback to scanning from the front
-                // to avoid a worst-case O(N) backward scan. (e.g. if jump > _rcv_wnd / 4)
-                if (node != null && TimeDiff(node.ValueRef.Segment.SerialNumber, serialNumber) > Math.Max(_rcv_wnd / 4, 16))
-                {
-                    node = _rcvBuf.First;
-                }
+            if (!itemRef.IsEmpty && itemRef.Segment.SerialNumber == serialNumber)
+            {
+                return false; // Duplicate
+            }
+
+            // Copy data and insert
+            KcpBuffer kcpBuffer;
+            if (originalBuffer is not null)
+            {
+                // We keep a reference to the same buffer and share memory ownership
+                kcpBuffer = KcpBuffer.FromRetainedOwner(((IRefCountedBuffer)originalBuffer).Retain(), originalBuffer.Memory.Slice(dataOffsetInBuffer), data.Length);
             }
             else
             {
-                node = _rcvBuf.Last;
+                // If it came from a pooled array but without a shared owner, we must rent our own and copy it
+                var rented = _bufferPool.Rent(new KcpBufferPoolRentOptions(data.Length, false));
+                data.CopyTo(rented.Memory.Span);
+                kcpBuffer = KcpBuffer.CreateFromSpan(rented, rented.Memory.Span.Slice(0, data.Length));
             }
 
-            if (node is not null)
+            // In case of aliasing (which shouldn't happen due to window constraints), release the old one
+            if (!itemRef.IsEmpty)
             {
-                int initialDiff = TimeDiff(serialNumber, node.ValueRef.Segment.SerialNumber);
-                if (initialDiff > 0)
-                {
-                    while (node is not null)
-                    {
-                        int diff = TimeDiff(serialNumber, node.ValueRef.Segment.SerialNumber);
-                        if (diff < 0) break; // We should insert before the next node, which means `node` is the one to insert after
-                        if (diff == 0) return false;
-                        if (node.Next == null) break;
-
-                        if (TimeDiff(serialNumber, node.Next.ValueRef.Segment.SerialNumber) < 0)
-                        {
-                            break;
-                        }
-
-                        node = node.Next;
-                    }
-                }
-                else if (initialDiff < 0)
-                {
-                    int scanCount = 0;
-                    while (node is not null)
-                    {
-                        int diff = TimeDiff(serialNumber, node.ValueRef.Segment.SerialNumber);
-                        if (diff > 0) break;
-                        if (diff == 0) return false;
-                        node = node.Previous;
-                        scanCount++;
-
-                        // Protective guard: if we are scanning backwards for too long, switch to scanning forwards from the first node.
-                        if (scanCount > 16 && node != null && node != _rcvBuf.First)
-                        {
-                            node = _rcvBuf.First;
-                            initialDiff = TimeDiff(serialNumber, node!.ValueRef.Segment.SerialNumber);
-                            if (initialDiff > 0)
-                            {
-                                // Scan forwards from start
-                                while (node is not null)
-                                {
-                                    diff = TimeDiff(serialNumber, node.ValueRef.Segment.SerialNumber);
-                                    if (diff < 0) break;
-                                    if (diff == 0) return false;
-                                    if (node.Next == null) break;
-                                    if (TimeDiff(serialNumber, node.Next.ValueRef.Segment.SerialNumber) < 0) break;
-                                    node = node.Next;
-                                }
-                                break;
-                            }
-                            else if (initialDiff < 0)
-                            {
-                                // Smaller than the first element
-                                node = null;
-                                break;
-                            }
-                            else
-                            {
-                                return false;
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    return false;
-                }
+                itemRef.Data.Release();
             }
 
-            KcpBuffer kcpData;
-            if (data.Length == 0)
+            itemRef = new KcpSendReceiveBufferItem
             {
-                kcpData = default;
-            }
-            else if (originalBuffer is not null)
-            {
-                if (originalBuffer is IRefCountedBuffer refCounted)
-                {
-                    refCounted.Retain();
-                    try
-                    {
-                        var slice = originalBuffer.Memory.Slice(dataOffsetInBuffer, data.Length);
-                        kcpData = KcpBuffer.FromRetainedOwner(refCounted, slice, data.Length);
-                    }
-                    catch
-                    {
-                        refCounted.Dispose();
-                        throw;
-                    }
-                }
-                else
-                {
-                    // For unknown IMemoryOwner without reference counting, copy to a pooled buffer
-                    var buffer = _bufferPool.Rent(new KcpBufferPoolRentOptions(data.Length, false));
-                    try
-                    {
-                        var spanToCopy = originalBuffer.Memory.Span.Slice(dataOffsetInBuffer, data.Length);
-                        kcpData = KcpBuffer.CreateFromSpan(buffer, spanToCopy);
-                    }
-                    catch
-                    {
-                        buffer.Dispose();
-                        throw;
-                    }
-                }
-            }
-            else
-            {
-                var buffer = _bufferPool.Rent(new KcpBufferPoolRentOptions(data.Length, false));
-                kcpData = KcpBuffer.CreateFromSpan(buffer, data);
-            }
-
-            KcpSendReceiveBufferItem item = new()
-            {
-                Data = kcpData,
-                Segment = header
+                Data = kcpBuffer,
+                Segment = DuplicateHeader(ref header, 0, 0, 0),
+                IsEmpty = false
             };
-            var newNode = _rcvCache.Allocate(in item);
-            if (node is null)
-                _rcvBuf.AddFirst(newNode);
-            else
-                _rcvBuf.AddAfter(node, newNode);
-
-            _lastRcvNodeHint = newNode;
 
             mutated = true;
 
             // move available data from rcv_buf -> rcv_queue
-            node = _rcvBuf.First;
-            while (node is not null)
+            while (_receiveQueue.GetQueueSize() < _rcv_wnd)
             {
-                var next = node.Next;
+                int nxtIndex = (int)(_rcv_nxt % (uint)_rcvBufArray.Length);
+                ref var nxtItemRef = ref _rcvBufArray[nxtIndex];
 
-                if (node.ValueRef.Segment.SerialNumber == _rcv_nxt && _receiveQueue.GetQueueSize() < _rcv_wnd)
+                if (!nxtItemRef.IsEmpty && nxtItemRef.Segment.SerialNumber == _rcv_nxt)
                 {
-                    if (_lastRcvNodeHint == node)
-                        _lastRcvNodeHint = next;
+                    _receiveQueue.Enqueue(nxtItemRef.Data, nxtItemRef.Segment.Fragment);
 
-                    _rcvBuf.Remove(node);
-
-                    _receiveQueue.Enqueue(node.ValueRef.Data, node.ValueRef.Segment.Fragment);
-
-                    node.ValueRef.Data = default;
-                    _rcvCache.Return(node);
+                    nxtItemRef.Data = default;
+                    nxtItemRef.IsEmpty = true;
                     _rcv_nxt++;
                     mutated = true;
                 }
@@ -1840,13 +1808,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 {
                     break;
                 }
-
-                node = next;
-            }
-
-            if (_lastRcvNodeHint?.List == null)
-            {
-                _lastRcvNodeHint = null;
             }
         }
 
@@ -1858,52 +1819,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         _ackList.Add(serialNumber, timestamp);
     }
 
-    private void HandleFastAck(uint serialNumber, uint timestamp)
-    {
-        if (_fastresend <= 0) return; // FastAck disabled
-        if (TimeDiff(serialNumber, _snd_una) < 0 || TimeDiff(serialNumber, _snd_nxt) >= 0) return;
 
-        lock (_sndBufLock)
-        {
-            var resent = (uint)_fastresend;
-            int index = (int)(serialNumber % (uint)_sndBufArray.Length);
-
-            if (_sndBufArray[index].IsEmpty || _sndBufArray[index].Segment.SerialNumber != serialNumber)
-            {
-                return;
-            }
-
-            // Apply FastAck going backwards
-            // Limit the scan backwards to fastresend * 2 nodes to avoid O(N) scan across entire window
-            int inflightCount = (int)((uint)TimeDiff(serialNumber, _snd_una));
-            int scanLimit = Math.Min(inflightCount, Math.Max(_fastresend * 4, (int)_snd_wnd));
-            int scanned = 0;
-
-            uint prevSn = serialNumber - 1;
-
-            while (TimeDiff(prevSn, _snd_una) >= 0 && scanned < scanLimit)
-            {
-                int prevIndex = (int)(prevSn % (uint)_sndBufArray.Length);
-                ref var item = ref _sndBufArray[prevIndex];
-
-                if (!item.IsEmpty && item.Segment.SerialNumber == prevSn)
-                {
-                    ref var stats = ref item.Stats;
-                    if (stats.FastAck <= resent)
-                    {
-                        // Only update fastAck if it hasn't been retransmitted too many times, to avoid storms
-                        if (stats.TransmitCount <= _fastlimit || _fastlimit == 0)
-                        {
-                            stats = new KcpSendSegmentStats(stats.ResendTimestamp, stats.Rto, stats.FastAck + 1,
-                                stats.TransmitCount);
-                        }
-                    }
-                }
-                prevSn--;
-                scanned++;
-            }
-        }
-    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static uint GetTimestamp()
@@ -2127,15 +2043,15 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         lock (_rcvBufLock)
         {
-            while (_rcvBuf.First is not null)
+            for (int i = 0; i < _rcvBufArray.Length; i++)
             {
-                var node = _rcvBuf.First;
-                _rcvBuf.RemoveFirst();
-                node.ValueRef.Data.Release();
-                node.ValueRef = default;
-                _rcvCache.Return(node);
+                if (!_rcvBufArray[i].IsEmpty)
+                {
+                    _rcvBufArray[i].Data.Release();
+                    _rcvBufArray[i].IsEmpty = true;
+                    _rcvBufArray[i].Data = default;
+                }
             }
-            _lastRcvNodeHint = null;
         }
 
         _ackList.Clear();
