@@ -468,7 +468,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     {
         if (OperatingSystem.IsLinux() && _socket.Handle != IntPtr.Zero)
         {
-            _ = Task.Run(RunReceiveLoopLinuxAsync);
+            _ = Task.Factory.StartNew(RunReceiveLoopLinuxAsync, default, TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
             return;
         }
 
@@ -622,9 +622,6 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 private async Task RunReceiveLoopLinuxAsync()
     {
         // Hop off the threadpool to run a blocking recvmmsg loop.
-        // This is safe because RunReceiveLoopLinuxAsync is called in a fire-and-forget Task.Run
-        // from Start(), but since we are doing Socket.Poll which blocks, we should ensure
-        // we yield control first, or explicitly request a LongRunning thread if desired.
         // Task.Yield() ensures we hop onto a clean thread-pool thread to become a dedicated receiver.
         await Task.Yield();
 
@@ -816,7 +813,7 @@ private async Task RunReceiveLoopLinuxAsync()
                 // Await tasks outside of the unsafe block
                 for (int i = 0; i < taskCount; i++)
                 {
-                    await FireAndForgetInput(tasks[i]).ConfigureAwait(false);
+                    FireAndForgetInput(tasks[i]).AsTask().Wait();
                     tasks[i] = default; // clear
                 }
             }

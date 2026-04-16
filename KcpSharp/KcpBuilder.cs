@@ -44,6 +44,8 @@ public sealed class KcpBuilder
 
     private Socket? _socket;
 
+    private IPEndPoint? _localEndPoint;
+
     /// <summary>
     ///     Creates an underlying UDP Socket automatically.
     /// </summary>
@@ -58,6 +60,15 @@ public sealed class KcpBuilder
         }
         socket.Blocking = false;
         _socket = socket;
+        return this;
+    }
+
+    /// <summary>
+    ///     Sets the local endpoint. The created socket will be bound to this endpoint automatically.
+    /// </summary>
+    public KcpBuilder WithLocalEndPoint(IPEndPoint localEndPoint)
+    {
+        _localEndPoint = localEndPoint;
         return this;
     }
 
@@ -92,17 +103,21 @@ public sealed class KcpBuilder
     /// <summary>
     ///     Builds the KcpConversation.
     /// </summary>
-    public IKcpConversation Build()
+    public KcpConversation Build()
     {
         if (_transport == null && _socket == null)
             throw new InvalidOperationException("Transport or Socket is required.");
         if (_remoteEndPoint == null)
             throw new InvalidOperationException("RemoteEndPoint is required.");
 
-        IKcpConversation conversation;
+        KcpConversation conversation;
 
         if (_socket != null)
         {
+            if (_localEndPoint != null && !_socket.IsBound)
+            {
+                _socket.Bind(_localEndPoint);
+            }
             var transport = KcpSocketTransport.CreateConversation(_socket, _remoteEndPoint, _conversationId.GetValueOrDefault(), _options);
             conversation = transport.Connection;
             transport.Start();
@@ -114,9 +129,9 @@ public sealed class KcpBuilder
                 : new KcpConversation(_remoteEndPoint, _transport!, _options);
         }
 
-        if (_exceptionHandler != null && conversation is KcpConversation c)
+        if (_exceptionHandler != null)
         {
-            c.SetExceptionHandler(_exceptionHandler, _exceptionHandlerState);
+            conversation.SetExceptionHandler(_exceptionHandler, _exceptionHandlerState);
         }
 
         return conversation;
