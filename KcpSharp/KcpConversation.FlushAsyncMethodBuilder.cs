@@ -201,7 +201,8 @@ partial class KcpConversation
 
             void IValueTaskSource.GetResult(short token)
             {
-                throw new NotSupportedException();
+                System.Diagnostics.Debug.Fail("GetResult called on base StateMachineBox - this indicates a bug in the state machine box lifecycle.");
+                throw new InvalidOperationException("Internal error: GetResult called on base StateMachineBox.");
             }
 
             public void SetResult()
