@@ -14,6 +14,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
     private readonly int _mss;
 
     private readonly LinkedList<(KcpBuffer Data, byte Fragment)> _queue;
+    private int _queueCount;
     private readonly bool _stream;
     private readonly KcpConversationUpdateActivation _updateActivation;
 
@@ -190,6 +191,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
                 results[count] = (node.ValueRef.Data, node.ValueRef.Fragment);
                 _queue.RemoveFirst();
+                _queueCount--;
                 node.ValueRef = default;
                 _cache.Return(node);
                 count++;
@@ -395,6 +397,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     buffer = buffer.Slice(size);
 
                     _queue.AddLast(_cache.Rent(kcpBuffer, _stream ? (byte)0 : (byte)fragment));
+                    _queueCount++;
                     Interlocked.Add(ref _unflushedBytes, size);
                     bytesWritten += size;
                     addedToQueue++;
@@ -487,6 +490,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     buffer = buffer.Slice(size);
 
                     _queue.AddLast(_cache.Rent(kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex));
+                    _queueCount++;
                     Interlocked.Add(ref _unflushedBytes, size);
                     usedSlots++;
                     currentFragmentIndex--;
@@ -580,6 +584,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     buffer = buffer.Slice(size);
 
                     _queue.AddLast(_cache.Rent(kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex));
+                    _queueCount++;
                     Interlocked.Add(ref _unflushedBytes, size);
                     usedSlots++;
                     currentFragmentIndex--;
@@ -761,15 +766,6 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         var unflushedBytes = Interlocked.Add(ref _unflushedBytes, -bytes);
         if (unflushedBytes <= 0)
         {
-            if (unflushedBytes < 0)
-            {
-                long current;
-                do
-                {
-                    current = Interlocked.Read(ref _unflushedBytes);
-                    if (current >= 0) break;
-                } while (Interlocked.CompareExchange(ref _unflushedBytes, 0, current) != current);
-            }
 
             bool executeSetResult = false;
             lock (_syncRoot)

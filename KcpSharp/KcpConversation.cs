@@ -67,6 +67,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private readonly KcpSendReceiveBufferItem[] _rcvBufArray;
 
     private readonly KcpAcknowledgeList _ackList;
+    private (uint, uint)[] _cachedAckSnapshotArray;
 
     private readonly int _fastresend;
     private readonly int _fastlimit;
@@ -243,6 +244,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 ? KcpConversationOptions.ReceiveQueueSizeDefaultValue
                 : options.ReceiveQueueSize, _receiveQueueItemCache);
         _ackList = new KcpAcknowledgeList(_sendQueue, (int)_rcv_wnd);
+        _cachedAckSnapshotArray = new (uint, uint)[Math.Max(128, (int)_rcv_wnd)];
 
         _updateLoopCts = new CancellationTokenSource();
 
@@ -574,7 +576,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             KcpMetrics.AckSnapshotPartial.Add(1);
         }
 
-        var ackSnapshotArray = System.Buffers.ArrayPool<(uint, uint)>.Shared.Rent(snapshotLimit);
+        // Check if we need to resize the cached array
+        if (_cachedAckSnapshotArray.Length < snapshotLimit)
+        {
+            _cachedAckSnapshotArray = new (uint, uint)[Math.Max(_cachedAckSnapshotArray.Length * 2, snapshotLimit)];
+        }
+        var ackSnapshotArray = _cachedAckSnapshotArray;
         try
         {
             var ackCount = _ackList.SnapshotAndClear(ackSnapshotArray.AsSpan(0, snapshotLimit));
@@ -642,7 +649,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
         finally
         {
-            System.Buffers.ArrayPool<(uint, uint)>.Shared.Return(ackSnapshotArray);
+            // ArrayPool is no longer used, so nothing to return
         }
     }
 
@@ -787,6 +794,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                     bool needsFlush = false;
                     const int BatchSize = 32;
 
+                    var batchHeaders = System.Buffers.ArrayPool<KcpPacketHeader>.Shared.Rent(BatchSize);
+                    var batchData = System.Buffers.ArrayPool<KcpBuffer>.Shared.Rent(BatchSize);
+                    int batchCount = 0;
+
                     lock (_sndBufLock)
                     {
                         unacknowledged = _rcv_nxt;
@@ -854,13 +865,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                                 if (size + need > sizeLimitBeforePostBuffer)
                                 {
                                     needsFlush = true;
-                                    break; // keep nextSn at the current value to retry on next loop
+                                    break;
                                 }
 
                                 bool incrementRetransmission = false;
                                 bool incrementFastRetransmission = false;
 
-                                // It fits! We can now commit the stats changes safely
                                 if (stats.TransmitCount == 0)
                                 {
                                     stats = new KcpSendSegmentStats(current + stats.Rto + rtomin,
@@ -869,15 +879,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                                 else if (TimeDiff(current, stats.ResendTimestamp) >= 0)
                                 {
                                     var rto = stats.Rto;
-                                    if (!_nodelay)
-                                    {
-                                        rto += Math.Max(stats.Rto, _rx_rto);
-                                    }
-                                    else
-                                    {
-                                        var step = rto; //_nodelay < 2 ? segment.rto : _rx_rto;
-                                        rto += step / 2;
-                                    }
+                                    if (!_nodelay) rto += Math.Max(stats.Rto, _rx_rto);
+                                    else rto += rto / 2;
 
                                     stats = new KcpSendSegmentStats(current + rto, rto, stats.FastAck, stats.TransmitCount + 1);
                                     incrementRetransmission = true;
@@ -892,19 +895,13 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
                                 var header = DuplicateHeader(ref item.Segment, current, windowSize, unacknowledged);
 
-                                // Process metrics inside the lock logic
                                 if (incrementRetransmission) KcpMetrics.RetransmissionCount.Add(1);
                                 if (incrementFastRetransmission) KcpMetrics.FastRetransmissionCount.Add(1);
 
-                                // Encode and copy INSIDE the lock to avoid Use-After-Free if HandleAck concurrently releases `data` buffer.
-                                header.EncodeHeader(_id, data.Length, buffer.Span.Slice(size), out var bytesWritten);
-                                size += bytesWritten;
-
-                                if (data.Length > 0)
-                                {
-                                    data.DataRegion.CopyTo(buffer.Slice(size));
-                                    size += data.Length;
-                                }
+                                // Snapshot for out-of-lock encoding
+                                batchHeaders[batchCount] = header;
+                                batchData[batchCount] = data;
+                                batchCount++;
                             }
 
                             nextSn = sn + 1;
@@ -912,9 +909,28 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
                         if (!needsFlush && (!nextSn.HasValue || TimeDiff(nextSn.Value, _snd_nxt) >= 0))
                         {
-                            nextSn = null; // Finished processing all unacknowledged items
+                            nextSn = null;
                         }
-                    } // Unlock
+                    } // Unlock _sndBufLock
+
+                    // Encode outside lock (H-1)
+                    for (int i = 0; i < batchCount; i++)
+                    {
+                        var header = batchHeaders[i];
+                        var data = batchData[i];
+
+                        header.EncodeHeader(_id, data.Length, buffer.Span.Slice(size), out var bytesWritten);
+                        size += bytesWritten;
+
+                        if (data.Length > 0)
+                        {
+                            data.DataRegion.CopyTo(buffer.Slice(size));
+                            size += data.Length;
+                        }
+                    }
+
+                    System.Buffers.ArrayPool<KcpPacketHeader>.Shared.Return(batchHeaders);
+                    System.Buffers.ArrayPool<KcpBuffer>.Shared.Return(batchData);
 
                     // 2. Flush asynchronously outside the lock
                     if (needsFlush)
@@ -1430,7 +1446,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             {
                 // Pure ACK/Probe packet, process inline to avoid queue hop
                 uint current = GetTimestamp();
-                bool mutated = SetInput(packet.Span, null, current); // null because no push means no data stored
+                bool mutated = ProcessInlineAcksAndProbes(packet.Span, current);
                 if (mutated)
                 {
                     _updateActivation?.Notify();
@@ -1454,6 +1470,127 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             throw;
         }
     }
+
+        private bool ProcessInlineAcksAndProbes(ReadOnlySpan<byte> packet, uint current)
+    {
+        var packetHeaderSize = _id.HasValue
+            ? KcpGlobalVars.HEADER_LENGTH_WITH_CONVID
+            : KcpGlobalVars.HEADER_LENGTH_WITHOUT_CONVID;
+
+        uint maxack = 0, latest_ts = 0;
+        var flag = false;
+        var mutated = false;
+
+        try
+        {
+            while (true)
+            {
+                if (packet.Length < packetHeaderSize) break;
+
+                KcpPacketHeader header;
+                int length;
+                try
+                {
+                    int offset = _id.HasValue ? 4 : 0;
+                    if (_id.HasValue && System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(packet) != _id.GetValueOrDefault()) return mutated;
+                    header = KcpPacketHeader.Parse(packet.Slice(offset));
+                    length = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(offset + 16));
+
+                    packet = packet.Slice(packetHeaderSize);
+                    if ((uint)length > (uint)packet.Length) return mutated;
+                }
+                catch
+                {
+                    return mutated;
+                }
+
+                Volatile.Write(ref _lastReceiveTick, current);
+                var newRmtWnd = header.WindowSize;
+                if (newRmtWnd != Volatile.Read(ref _rmt_wnd))
+                {
+                    Volatile.Write(ref _rmt_wnd, newRmtWnd);
+                }
+                mutated = HandleUnacknowledged(header.Unacknowledged) | mutated;
+
+                if (header.Command == KcpCommand.Ack)
+                {
+                    var rtt = TimeDiff(current, header.Timestamp);
+                    if (rtt >= 0) UpdateRtoThreadSafe(rtt);
+
+                    bool ackMutated = HandleAck(header.SerialNumber, out int bytesFreed);
+                    mutated |= ackMutated;
+                    if (bytesFreed > 0)
+                        _sendQueue.SubtractUnflushedBytes(bytesFreed);
+
+                    if (!flag)
+                    {
+                        flag = true;
+                        maxack = header.SerialNumber;
+                        latest_ts = header.Timestamp;
+                    }
+                    else
+                    {
+                        if (TimeDiff(header.SerialNumber, maxack) > 0)
+                        {
+                            maxack = header.SerialNumber;
+                            latest_ts = header.Timestamp;
+                        }
+                    }
+                }
+                else if (header.Command == KcpCommand.WindowProbe)
+                {
+                    // Thread-safe update of _probe (assuming it's casted to int for Interlocked)
+                    UpdateProbeThreadSafe(KcpProbeType.AskTell);
+                }
+
+                packet = packet.Slice(length);
+            }
+
+            if (flag)
+            {
+                while (true)
+                {
+#pragma warning disable CS0420
+                    var currentMaxAck = Volatile.Read(ref _max_ack_sn);
+                    if (Volatile.Read(ref _max_ack_has_value) == 1 && TimeDiff(maxack, currentMaxAck) <= 0) break;
+
+                    if (Interlocked.CompareExchange(ref _max_ack_sn, maxack, currentMaxAck) == currentMaxAck)
+                    {
+                        Volatile.Write(ref _max_ack_has_value, 1);
+#pragma warning restore CS0420
+                        break;
+                    }
+                }
+            }
+
+            return mutated;
+        }
+        catch
+        {
+            return mutated;
+        }
+    }
+
+    private readonly System.Threading.Lock _rtoLock = new();
+
+    private void UpdateRtoThreadSafe(int rtt)
+    {
+        lock (_rtoLock)
+        {
+            UpdateRto(rtt);
+        }
+    }
+
+    private void UpdateProbeThreadSafe(KcpProbeType flags)
+    {
+        // Assuming _probe is byte or int. It's currently KcpProbeType (enum). We can lock or use Interlocked if it's int.
+        // It's easier to lock RTO lock or sndBufLock to avoid too many locks.
+        lock (_rtoLock)
+        {
+            _probe |= flags;
+        }
+    }
+
 
     private bool SetInput(ReadOnlySpan<byte> packet, System.Buffers.IMemoryOwner<byte>? originalBuffer, uint current)
     {
@@ -1558,7 +1695,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 }
                 else if (header.Command == KcpCommand.WindowProbe)
                 {
-                    _probe |= KcpProbeType.AskTell;
+                    UpdateProbeThreadSafe(KcpProbeType.AskTell);
                 }
                 else if (header.Command == KcpCommand.WindowSize)
                 {
@@ -1760,21 +1897,25 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             // Copy data and insert
-            KcpBuffer kcpBuffer;
-            if (originalBuffer is not null)
+            KcpBuffer kcpBuffer = default;
+            if (data.Length > 0)
             {
-                // We keep a reference to the same buffer and share memory ownership
-                kcpBuffer = KcpBuffer.FromRetainedOwner(((IRefCountedBuffer)originalBuffer).Retain(), originalBuffer.Memory.Slice(dataOffsetInBuffer), data.Length);
-            }
-            else
-            {
-                // If it came from a pooled array but without a shared owner, we must rent our own and copy it
-                var rented = _bufferPool.Rent(new KcpBufferPoolRentOptions(data.Length, false));
-                data.CopyTo(rented.Memory.Span);
-                kcpBuffer = KcpBuffer.CreateFromSpan(rented, rented.Memory.Span.Slice(0, data.Length));
+                if (originalBuffer is IRefCountedBuffer refCounted)
+                {
+                    // We keep a reference to the same buffer and share memory ownership
+                    kcpBuffer = KcpBuffer.FromRetainedOwner(refCounted.Retain(), originalBuffer.Memory.Slice(dataOffsetInBuffer), data.Length);
+                }
+                else
+                {
+                    // If it came from a pooled array but without a shared owner, we must rent our own and copy it
+                    var rented = _bufferPool.Rent(new KcpBufferPoolRentOptions(data.Length, false));
+                    data.CopyTo(rented.Memory.Span);
+                    kcpBuffer = KcpBuffer.CreateFromSpan(rented, rented.Memory.Span.Slice(0, data.Length));
+                }
             }
 
-            // In case of aliasing (which shouldn't happen due to window constraints), release the old one
+            // In case of aliasing (which shouldn't happen due to window constraints), verify it's empty
+            System.Diagnostics.Debug.Assert(itemRef.IsEmpty, "Ring buffer aliasing detected! Overwriting unacknowledged segment. Congestion window bounds exceeded.");
             if (!itemRef.IsEmpty)
             {
                 itemRef.Data.Release();
