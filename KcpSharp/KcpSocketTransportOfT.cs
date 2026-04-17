@@ -59,7 +59,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     private CancellationTokenSource? _cts;
     private bool _disposed;
 
-    private readonly byte[][][] _batchBuffers;
+    private readonly Memory<byte>[][] _batchBuffers;
+    private byte[]? _batchBufferSlab;
     private readonly IPEndPoint?[][] _batchEndpoints;
     private readonly int[][] _batchSizes;
     private readonly byte[][][] _batchAddresses;
@@ -93,7 +94,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
         _maxBatchSize = maxBatchSize;
 
-        _batchBuffers = new byte[2][][];
+        _batchBuffers = new Memory<byte>[2][];
         _batchEndpoints = new IPEndPoint?[2][];
         _batchSizes = new int[2][];
         _batchAddresses = new byte[2][][];
@@ -101,13 +102,17 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
         if (maxBatchSize > 0)
         {
+            _batchBufferSlab = GC.AllocateUninitializedArray<byte>(2 * maxBatchSize * _mtu, pinned: true);
+            int slabOffset = 0;
+
             for (int s = 0; s < 2; s++)
             {
-                _batchBuffers[s] = new byte[maxBatchSize][];
+                _batchBuffers[s] = new Memory<byte>[maxBatchSize];
                 _batchAddresses[s] = new byte[maxBatchSize][];
                 for (int i = 0; i < maxBatchSize; i++)
                 {
-                    _batchBuffers[s][i] = GC.AllocateUninitializedArray<byte>(_mtu, pinned: true);
+                    _batchBuffers[s][i] = new Memory<byte>(_batchBufferSlab, slabOffset, _mtu);
+                    slabOffset += _mtu;
                     _batchAddresses[s][i] = new byte[128]; // Max SocketAddress size
                 }
 
@@ -185,7 +190,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
             sa.Buffer.Span.Slice(0, sa.Size).CopyTo(_batchAddresses[activeSet][slotIndex]);
             _batchAddressLengths[activeSet][slotIndex] = sa.Size;
 
-            var slice = _batchBuffers[activeSet][slotIndex].AsMemory(0, requiredSize);
+            var slice = _batchBuffers[activeSet][slotIndex].Slice(0, requiredSize);
             dataWriter(slice);
 
             _batchCount++;
@@ -253,7 +258,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                                 for (int i = 0; i < countToFlush; i++)
                                 {
                                     // _batchBuffers is allocated with pinned: true
-                                    ref byte firstByte = ref _batchBuffers[activeSet][i][0];
+                                    ref byte firstByte = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(_batchBuffers[activeSet][i].Span);
                                     pIovecs[i].iov_base = System.Runtime.CompilerServices.Unsafe.AsPointer(ref firstByte);
                                     pIovecs[i].iov_len = (nuint)_batchSizes[activeSet][i];
 
@@ -315,7 +320,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                     try
                     {
                         await _socket
-                            .SendToAsync(_batchBuffers[activeSet][i].AsMemory(0, _batchSizes[activeSet][i]),
+                            .SendToAsync(_batchBuffers[activeSet][i].Slice(0, _batchSizes[activeSet][i]),
                                          SocketFlags.None,
                                          _batchEndpoints[activeSet][i]!,
                                          cancellationToken)
@@ -432,12 +437,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
             if (x is null || y is null) return false;
             if (x.Family != y.Family || x.Size != y.Size) return false;
 
-            for (int i = 0; i < x.Size; i++)
-            {
-                if (x[i] != y[i]) return false;
-            }
-
-            return true;
+            return x.Buffer.Span.Slice(0, x.Size).SequenceEqual(y.Buffer.Span.Slice(0, y.Size));
         }
 
         public int GetHashCode(SocketAddress obj)
@@ -615,7 +615,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
             var owner = s_sharedPacketOwnerPool.Get();
             owner.Initialize(s_sharedPacketOwnerPool, bytesReceived);
             packetMemory.Span.CopyTo(owner.Memory.Span);
-            _ = FireAndForgetInput(sink.InputPacketAsync(owner.Memory.Slice(0, bytesReceived), ep, owner, default));
+            FireAndForgetInput(sink.InputPacketAsync(owner.Memory.Slice(0, bytesReceived), ep, owner, default));
         }
     }
 
@@ -637,11 +637,12 @@ private async Task RunReceiveLoopLinuxAsync()
         KcpSocketTransportNative.mmsghdr[] msgvecPool = ArrayPool<KcpSocketTransportNative.mmsghdr>.Shared.Rent(maxBatchSize);
         KcpSocketTransportNative.iovec[] iovecsPool = ArrayPool<KcpSocketTransportNative.iovec>.Shared.Rent(maxBatchSize);
         byte[] addressBuffer = ArrayPool<byte>.Shared.Rent(maxBatchSize * 128);
-        byte[][] buffers = new byte[maxBatchSize][];
+        byte[] rxSlab = GC.AllocateUninitializedArray<byte>(maxBatchSize * 65536, pinned: true);
+        Memory<byte>[] buffers = new Memory<byte>[maxBatchSize];
 
         for (int i = 0; i < maxBatchSize; i++)
         {
-            buffers[i] = GC.AllocateUninitializedArray<byte>(65536, pinned: true);
+            buffers[i] = new Memory<byte>(rxSlab, i * 65536, 65536);
         }
 
         IPEndPoint? cachedEndpoint = null;
@@ -708,7 +709,7 @@ private async Task RunReceiveLoopLinuxAsync()
                     {
                         for (int i = 0; i < maxBatchSize; i++)
                         {
-                            ref byte firstByte = ref buffers[i][0];
+                            ref byte firstByte = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(buffers[i].Span);
                             pIovecs[i].iov_base = System.Runtime.CompilerServices.Unsafe.AsPointer(ref firstByte);
                             pIovecs[i].iov_len = 65536;
 
@@ -786,7 +787,7 @@ private async Task RunReceiveLoopLinuxAsync()
                                 }
                             }
 
-                            Memory<byte> bufferMemory = buffers[i].AsMemory(0, (int)bytesReceived);
+                            Memory<byte> bufferMemory = buffers[i].Slice(0, (int)bytesReceived);
                             var packet = bufferMemory.Slice(0, (int)bytesReceived);
 
                             if (OnRawPacketReceived(packet, endpoint))
@@ -813,7 +814,7 @@ private async Task RunReceiveLoopLinuxAsync()
                 // Await tasks outside of the unsafe block
                 for (int i = 0; i < taskCount; i++)
                 {
-                    FireAndForgetInput(tasks[i]).AsTask().Wait();
+                    FireAndForgetInput(tasks[i]);
                     tasks[i] = default; // clear
                 }
             }
@@ -833,10 +834,10 @@ private async Task RunReceiveLoopLinuxAsync()
         }
     }
 
-    private async ValueTask FireAndForgetInput(ValueTask task)
+    private async void FireAndForgetInput(ValueTask task)
     {
         // No need to dispose the owner here: ownership was already transferred to InputPacketAsync
-        await task.ConfigureAwait(false);
+        try { await task.ConfigureAwait(false); } catch (Exception ex) { HandleExceptionWrapper(ex); }
     }
 
     private bool HandleExceptionWrapper(Exception ex)

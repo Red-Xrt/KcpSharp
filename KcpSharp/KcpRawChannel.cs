@@ -135,6 +135,12 @@ internal sealed class KcpRawChannel : IKcpConversation, IKcpExceptionProducer<Kc
     }
 
     /// <inheritdoc />
+    public async ValueTask DisposeAsync()
+    {
+        Dispose();
+        await System.Threading.Tasks.Task.CompletedTask;
+    }
+
     public void Dispose()
     {
         SetTransportClosed();

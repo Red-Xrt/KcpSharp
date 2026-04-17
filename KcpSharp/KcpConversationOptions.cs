@@ -1,4 +1,4 @@
-﻿namespace KcpSharp;
+namespace KcpSharp;
 
 /// <summary>
 ///     Options used to control the behaviors of <see cref="KcpConversation" />.
@@ -213,4 +213,20 @@ public class KcpConversationOptions
         SendQueueSize = 128,
         ReceiveQueueSize = 128,
     };
+    /// <summary>
+    ///     Validates the options, throwing an ArgumentException if any option is invalid.
+    /// </summary>
+    public void Validate()
+    {
+        if (Mtu < 50)
+            throw new ArgumentException("MTU must be at least 50 bytes.", nameof(Mtu));
+        if (UpdateInterval < 0)
+            throw new ArgumentException("UpdateInterval must be a positive integer.", nameof(UpdateInterval));
+        if (FastResend < 0)
+            throw new ArgumentException("FastResend must be a positive integer.", nameof(FastResend));
+        if (SendWindow <= 0)
+            throw new ArgumentException("SendWindow must be greater than zero.", nameof(SendWindow));
+        if (ReceiveWindow <= 0)
+            throw new ArgumentException("ReceiveWindow must be greater than zero.", nameof(ReceiveWindow));
+    }
 }

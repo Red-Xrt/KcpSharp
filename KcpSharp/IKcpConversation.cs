@@ -3,7 +3,7 @@ namespace KcpSharp;
 /// <summary>
 ///     Represents a reliable conversation or channel over an underlying, potentially unreliable transport.
 /// </summary>
-public interface IKcpConversation : IDisposable
+public interface IKcpConversation : IDisposable, IAsyncDisposable
 {
     /// <summary>
     ///     Marks the underlying transport as closed and aborts all active send or receive operations.

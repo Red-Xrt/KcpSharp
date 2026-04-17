@@ -13,8 +13,12 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
     private readonly int _capacity;
     private readonly int _mss;
 
-    private readonly LinkedList<(KcpBuffer Data, byte Fragment)> _queue;
+    private readonly (KcpBuffer Data, byte Fragment)[] _queueArray;
+    private int _queueHead;
+    private int _queueTail;
     private int _queueCount;
+
+
     private readonly bool _stream;
     private readonly KcpConversationUpdateActivation _updateActivation;
 
@@ -49,7 +53,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             RunContinuationsAsynchronously = true
         };
 
-        _queue = new LinkedList<(KcpBuffer Data, byte Fragment)>();
+        _queueArray = new (KcpBuffer Data, byte Fragment)[capacity];
         _spaceSemaphore = new AsyncCapacityReserve(capacity);
     }
 
@@ -79,14 +83,13 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                 }
             }
 
-            var node = _queue.First;
-            while (node is not null)
+            while (_queueCount > 0)
             {
-                node.ValueRef.Data.Release();
-                node = node.Next;
+                _queueArray[_queueHead].Data.Release();
+                _queueArray[_queueHead] = default;
+                _queueHead = (_queueHead + 1) % _queueArray.Length;
+                _queueCount--;
             }
-
-            _queue.Clear();
             _cache.Clear();
             _transportClosed = true;
         }
@@ -184,16 +187,13 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         bool needSignal = false;
         lock (_syncRoot)
         {
-            while (count < maxCount && count < results.Length)
+            while (_queueCount > 0 && count < maxCount && count < results.Length)
             {
-                var node = _queue.First;
-                if (node is null) break;
-
-                results[count] = (node.ValueRef.Data, node.ValueRef.Fragment);
-                _queue.RemoveFirst();
+                var item = _queueArray[_queueHead];
+                results[count] = (item.Data, item.Fragment);
+                _queueArray[_queueHead] = default;
+                _queueHead = (_queueHead + 1) % _queueArray.Length;
                 _queueCount--;
-                node.ValueRef = default;
-                _cache.Return(node);
                 count++;
             }
 
@@ -224,7 +224,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
     private void GetAvailableSpaceCore(out int byteCount, out int segmentCount)
     {
         var mss = _mss;
-        var availableFragments = _capacity - _queue.Count;
+        var availableFragments = _capacity - _queueCount;
         if (availableFragments < 0)
         {
             byteCount = 0;
@@ -233,10 +233,10 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         }
 
         var availableBytes = availableFragments * mss;
-        if (_stream)
+        if (_stream && _queueCount > 0)
         {
-            var last = _queue.Last;
-            if (last is not null) availableBytes += _mss - last.ValueRef.Data.Length;
+            var last = _queueArray[(_queueTail - 1 + _queueArray.Length) % _queueArray.Length];
+            availableBytes += _mss - last.Data.Length;
         }
 
         byteCount = availableBytes;
@@ -303,10 +303,11 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             if (!allowPartialSend)
             {
                 int expand = 0;
-                if (_stream)
+                if (_stream && _queueCount > 0)
                 {
-                    var last = _queue.Last;
-                    if (last is not null) expand = mss - last.ValueRef.Data.Length;
+                    int lastIndex = (_queueTail - 1 + _queueArray.Length) % _queueArray.Length;
+                    var last = _queueArray[lastIndex];
+                    expand = mss - last.Data.Length;
                 }
 
                 if (buffer.Length > expand)
@@ -330,21 +331,18 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
             // Copy buffer content.
             bytesWritten = 0;
-            if (_stream)
+            if (_stream && _queueCount > 0)
             {
-                var node = _queue.Last;
-                if (node is not null)
+                int lastIndex = (_queueTail - 1 + _queueArray.Length) % _queueArray.Length;
+                ref var data = ref _queueArray[lastIndex].Data;
+                var expand = mss - data.Length;
+                expand = Math.Min(expand, buffer.Length);
+                if (expand > 0)
                 {
-                    ref var data = ref node.ValueRef.Data;
-                    var expand = mss - data.Length;
-                    expand = Math.Min(expand, buffer.Length);
-                    if (expand > 0)
-                    {
-                        data = data.AppendData(buffer.Slice(0, expand));
-                        buffer = buffer.Slice(expand);
-                        Interlocked.Add(ref _unflushedBytes, expand);
-                        bytesWritten = expand;
-                    }
+                    data = data.AppendData(buffer.Slice(0, expand));
+                    buffer = buffer.Slice(expand);
+                    Interlocked.Add(ref _unflushedBytes, expand);
+                    bytesWritten = expand;
                 }
 
                 if (buffer.IsEmpty)
@@ -396,7 +394,8 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Slice(0, size));
                     buffer = buffer.Slice(size);
 
-                    _queue.AddLast(_cache.Rent(kcpBuffer, _stream ? (byte)0 : (byte)fragment));
+                    _queueArray[_queueTail] = (kcpBuffer, _stream ? (byte)0 : (byte)fragment);
+                    _queueTail = (_queueTail + 1) % _queueArray.Length;
                     _queueCount++;
                     Interlocked.Add(ref _unflushedBytes, size);
                     bytesWritten += size;
@@ -460,21 +459,18 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     return false;
                 }
 
-                if (_stream)
+                if (_stream && _queueCount > 0)
                 {
-                    var node = _queue.Last;
-                    if (node is not null)
+                    int lastIndex = (_queueTail - 1 + _queueArray.Length) % _queueArray.Length;
+                    ref var dataRef = ref _queueArray[lastIndex].Data;
+                    var expand = mss - dataRef.Length;
+                    expand = Math.Min(expand, buffer.Length);
+                    if (expand > 0)
                     {
-                        ref var dataRef = ref node.ValueRef.Data;
-                        var expand = mss - dataRef.Length;
-                        expand = Math.Min(expand, buffer.Length);
-                        if (expand > 0)
-                        {
-                            dataRef = dataRef.AppendData(buffer.Span.Slice(0, expand));
-                            buffer = buffer.Slice(expand);
-                            Interlocked.Add(ref _unflushedBytes, expand);
-                            anySegmentAdded = true;
-                        }
+                        dataRef = dataRef.AppendData(buffer.Span.Slice(0, expand));
+                        buffer = buffer.Slice(expand);
+                        Interlocked.Add(ref _unflushedBytes, expand);
+                        anySegmentAdded = true;
                     }
                 }
 
@@ -489,7 +485,8 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Span.Slice(0, size));
                     buffer = buffer.Slice(size);
 
-                    _queue.AddLast(_cache.Rent(kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex));
+                    _queueArray[_queueTail] = (kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex);
+                    _queueTail = (_queueTail + 1) % _queueArray.Length;
                     _queueCount++;
                     Interlocked.Add(ref _unflushedBytes, size);
                     usedSlots++;
@@ -554,21 +551,18 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     throw new InvalidOperationException("Transport closed.");
                 }
 
-                if (_stream)
+                if (_stream && _queueCount > 0)
                 {
-                    var node = _queue.Last;
-                    if (node is not null)
+                    int lastIndex = (_queueTail - 1 + _queueArray.Length) % _queueArray.Length;
+                    ref var dataRef = ref _queueArray[lastIndex].Data;
+                    var expand = mss - dataRef.Length;
+                    expand = Math.Min(expand, buffer.Length);
+                    if (expand > 0)
                     {
-                        ref var dataRef = ref node.ValueRef.Data;
-                        var expand = mss - dataRef.Length;
-                        expand = Math.Min(expand, buffer.Length);
-                        if (expand > 0)
-                        {
-                            dataRef = dataRef.AppendData(buffer.Span.Slice(0, expand));
-                            buffer = buffer.Slice(expand);
-                            Interlocked.Add(ref _unflushedBytes, expand);
-                            anySegmentAdded = true;
-                        }
+                        dataRef = dataRef.AppendData(buffer.Span.Slice(0, expand));
+                        buffer = buffer.Slice(expand);
+                        Interlocked.Add(ref _unflushedBytes, expand);
+                        anySegmentAdded = true;
                     }
                 }
 
@@ -583,7 +577,8 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Span.Slice(0, size));
                     buffer = buffer.Slice(size);
 
-                    _queue.AddLast(_cache.Rent(kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex));
+                    _queueArray[_queueTail] = (kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex);
+                    _queueTail = (_queueTail + 1) % _queueArray.Length;
                     _queueCount++;
                     Interlocked.Add(ref _unflushedBytes, size);
                     usedSlots++;
@@ -749,7 +744,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         if (_activeWait && !_signaled && _operationMode == 1)
         {
             var unflushedBytes = Interlocked.Read(ref _unflushedBytes);
-            if (_queue.Last is null && unflushedBytes == 0 && !_ackListNotEmpty)
+            if (_queueCount == 0 && unflushedBytes == 0 && !_ackListNotEmpty)
             {
                 ClearPreviousOperation();
                 executeSetResult = true;
@@ -813,13 +808,13 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                 }
             }
 
-            var node = _queue.First;
-            while (node is not null)
+            while (_queueCount > 0)
             {
-                node.ValueRef.Data.Release();
-                node = node.Next;
+                _queueArray[_queueHead].Data.Release();
+                _queueArray[_queueHead] = default;
+                _queueHead = (_queueHead + 1) % _queueArray.Length;
+                _queueCount--;
             }
-            _queue.Clear();
             _cache.Clear();
 
             _transportClosed = true;

@@ -65,7 +65,10 @@ internal sealed class AsyncCapacityReserve : IDisposable
                 break;
         }
 
-        CheckWaiters();
+        if (_hasWaiters == 1)
+        {
+            CheckWaiters();
+        }
     }
 
     private void CheckWaiters()

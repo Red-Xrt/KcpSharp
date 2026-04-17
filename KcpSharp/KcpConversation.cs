@@ -8,7 +8,7 @@ namespace KcpSharp;
 /// <summary>
 ///     Represents a reliable data channel built on top of an underlying unreliable transport using the KCP protocol.
 /// </summary>
-public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionProducer<KcpConversation>, IKcpPacketSink
+public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionProducer<KcpConversation>, IKcpPacketSink, IAsyncDisposable
 {
     private readonly System.Threading.Lock _sndBufLock = new();
     private readonly SemaphoreSlim _flushSemaphore = new(1, 1);
@@ -45,7 +45,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     /// THREADING: Only accessed from RunUpdateOnActivationCore's single-threaded loop.
     /// Do NOT access from multiple threads without synchronization.
     /// </remarks>
-    private KcpProbeType _probe;
+    private volatile int _probe;
 
     private readonly uint _interval;
     private uint _ts_flush;
@@ -88,7 +88,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private int _disposed;
 
     private readonly Channel<bool> _flushSignalChannel;
-    private Task? _flushLoopTask;
+
 
     private KcpRentedBuffer _cachedFlushBuffer;
     private KcpRentedBuffer _cachedAckFlushBuffer;
@@ -981,7 +981,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         _probe_wait += _probe_wait / 2;
                         if (_probe_wait > IKCP_PROBE_LIMIT) _probe_wait = IKCP_PROBE_LIMIT;
                         _ts_probe = current + _probe_wait;
-                        _probe |= KcpProbeType.AskSend;
+                        System.Threading.Interlocked.Or(ref _probe, (int)KcpProbeType.AskSend);
                     }
                 }
             }
@@ -992,7 +992,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             // flush window probing command
-            if ((_probe & KcpProbeType.AskSend) != 0)
+            if (((KcpProbeType)_probe & KcpProbeType.AskSend) != 0)
             {
                 if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
                 {
@@ -1010,7 +1010,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             // flush window probing response
-            if ((_probe & KcpProbeType.AskTell) != 0)
+            if (((KcpProbeType)_probe & KcpProbeType.AskTell) != 0)
             {
                 if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
                 {
@@ -1028,7 +1028,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             // periodic window notification
-            if (!anyPacketSent && ShouldSendWindowSize(current) && (_probe & KcpProbeType.AskTell) == 0)
+            if (!anyPacketSent && ShouldSendWindowSize(current) && ((KcpProbeType)_probe & KcpProbeType.AskTell) == 0)
             {
                 if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
                 {
@@ -1060,7 +1060,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 buffer.Span.Slice(0, size).Clear();
             }
 
-            _probe = KcpProbeType.None;
+            System.Threading.Interlocked.Exchange(ref _probe, 0);
 
             if (batch is not null)
             {
@@ -1196,51 +1196,9 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private void RunUpdateOnActivation()
     {
         _updateLoopTask = Task.Run(RunUpdateOnActivationCore_Wrapped);
-        _flushLoopTask = Task.Run(RunFlushLoopCore_Wrapped);
     }
 
-    private async Task RunFlushLoopCore_Wrapped()
-    {
-        try
-        {
-            await RunFlushLoopCore().ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected shutdown
-        }
-        catch (Exception ex)
-        {
-            try { HandleFlushException(ex); } catch { SetTransportClosed(); }
-        }
-    }
 
-    private async Task RunFlushLoopCore()
-    {
-        var cancellationToken = _updateLoopCts?.Token ?? new CancellationToken(true);
-        var reader = _flushSignalChannel.Reader;
-
-        while (await reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
-        {
-            while (reader.TryRead(out _))
-            {
-                if (TransportClosed) return;
-
-                try
-                {
-                    await FlushCoreAsync(cancellationToken).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    if (!HandleFlushException(ex)) break;
-                }
-            }
-        }
-    }
 
     private async Task RunUpdateOnActivationCore_Wrapped()
     {
@@ -1328,6 +1286,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             try
             {
                 if (anyUpdate) await UpdateCoreAsync(cancellationToken, current).ConfigureAwait(false);
+
+                // Trigger the unified flush loop locally if any updates happened or ACKs pending
+                if (anyUpdate || _sendQueue.GetUnflushedBytes() > 0 || _ackList.Count > 0)
+                {
+                    await FlushCoreAsync(cancellationToken).ConfigureAwait(false);
+                }
             }
             catch (OperationCanceledException)
             {
@@ -1356,7 +1320,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         {
             _ts_flush += _interval;
             if (TimeDiff(current, _ts_flush) >= 0) _ts_flush = current + _interval;
-            _flushSignalChannel.Writer.TryWrite(true);
+
         }
 
         return default;
@@ -1571,24 +1535,14 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
     }
 
-    private readonly System.Threading.Lock _rtoLock = new();
-
     private void UpdateRtoThreadSafe(int rtt)
     {
-        lock (_rtoLock)
-        {
-            UpdateRto(rtt);
-        }
+        UpdateRto(rtt);
     }
 
     private void UpdateProbeThreadSafe(KcpProbeType flags)
     {
-        // Assuming _probe is byte or int. It's currently KcpProbeType (enum). We can lock or use Interlocked if it's int.
-        // It's easier to lock RTO lock or sndBufLock to avoid too many locks.
-        lock (_rtoLock)
-        {
-            _probe |= flags;
-        }
+        System.Threading.Interlocked.Or(ref _probe, (int)flags);
     }
 
 
@@ -2212,14 +2166,24 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         _ = DisposeBackgroundTasksAsync();
     }
 
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
+        SetTransportClosed();
+
+        try { _sendQueue.Dispose(); } catch { }
+        try { _receiveQueue.Dispose(); } catch { }
+
+        await DisposeBackgroundTasksAsync().ConfigureAwait(false);
+    }
+
     private async Task DisposeBackgroundTasksAsync()
     {
         try
         {
             if (_updateLoopTask != null)
                 await Task.WhenAny(_updateLoopTask, Task.Delay(2000)).ConfigureAwait(false);
-            if (_flushLoopTask != null)
-                await Task.WhenAny(_flushLoopTask, Task.Delay(2000)).ConfigureAwait(false);
+
         }
         catch { }
 

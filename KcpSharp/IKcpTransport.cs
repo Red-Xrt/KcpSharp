@@ -5,7 +5,7 @@ namespace KcpSharp;
 /// <summary>
 ///     A transport to send and receive packets.
 /// </summary>
-internal interface IKcpTransport
+public interface IKcpTransport
 {
     /// <summary>
     ///     Send a packet into the transport.
