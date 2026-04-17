@@ -52,14 +52,13 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
             {
                 _signaled = true;
                 _cancellationToken = default;
-                _cancellationRegistration.Dispose();
                 executeSetResult = true;
             }
         }
 
         if (executeSetResult)
         {
-            _mrvtsc.SetResult(new KcpConversationUpdateNotification(null, true));
+            _mrvtsc.SetResult(new KcpConversationUpdateNotification(null, false));
         }
 
         _ringBuffer.Dispose();
@@ -75,7 +74,6 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
             {
                 _signaled = true;
                 _cancellationToken = default;
-                _cancellationRegistration.Dispose();
                 executeSetResult = true;
             }
             else
@@ -86,7 +84,7 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
 
         if (executeSetResult)
         {
-            _mrvtsc.SetResult(new KcpConversationUpdateNotification(null, true));
+            _mrvtsc.SetResult(new KcpConversationUpdateNotification(null, false));
         }
     }
 
@@ -105,7 +103,7 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
             if (_notificationPending)
             {
                 _notificationPending = false;
-                return new ValueTask<KcpConversationUpdateNotification>(new KcpConversationUpdateNotification(null, true));
+                return new ValueTask<KcpConversationUpdateNotification>(new KcpConversationUpdateNotification(null, false));
             }
 
             if (_ringBuffer.TryDequeue(out var packet, out var bufferOwner))
@@ -159,14 +157,21 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
 
     KcpConversationUpdateNotification IValueTaskSource<KcpConversationUpdateNotification>.GetResult(short token)
     {
-        lock (SyncRoot)
+        _cancellationRegistration.Dispose();
+        try
         {
-            _activeWait = false;
-            _signaled = false;
-            _mrvtsc.Reset();
+            return _mrvtsc.GetResult(token);
         }
-
-        return _mrvtsc.GetResult(token);
+        finally
+        {
+            _mrvtsc.Reset();
+            lock (SyncRoot)
+            {
+                _activeWait = false;
+                _signaled = false;
+                _cancellationRegistration = default;
+            }
+        }
     }
 
     public ValueTask InputPacketAsync(ReadOnlyMemory<byte> packet, System.Buffers.IMemoryOwner<byte>? bufferOwner, CancellationToken cancellationToken)
@@ -216,6 +221,7 @@ internal sealed class KcpReceiveRingBuffer : IDisposable
     private readonly int _mask;
     private int _head;
     private int _tail;
+    private SpinLock _spinLock = new SpinLock(false);
 
     public KcpReceiveRingBuffer(int capacity)
     {
@@ -225,39 +231,51 @@ internal sealed class KcpReceiveRingBuffer : IDisposable
 
     public bool TryEnqueue(ReadOnlyMemory<byte> packet, System.Buffers.IMemoryOwner<byte>? owner)
     {
-        int tail = Volatile.Read(ref _tail);
-        int head = Volatile.Read(ref _head);
+        bool lockTaken = false;
+        try
+        {
+            _spinLock.Enter(ref lockTaken);
+            if (_tail - _head >= _slots.Length) return false;
 
-        if (tail - head >= _slots.Length) return false;
-
-        _slots[tail & _mask] = new Slot(packet, owner);
-        Volatile.Write(ref _tail, tail + 1);
-        return true;
+            _slots[_tail & _mask] = new Slot(packet, owner);
+            _tail++;
+            return true;
+        }
+        finally
+        {
+            if (lockTaken) _spinLock.Exit(false);
+        }
     }
 
     public bool TryDequeue(out ReadOnlyMemory<byte> packet, out System.Buffers.IMemoryOwner<byte>? owner)
     {
-        int head = Volatile.Read(ref _head);
-        int tail = Volatile.Read(ref _tail);
-
-        if (head == tail)
+        bool lockTaken = false;
+        try
         {
-            packet = default;
-            owner = null;
-            return false;
+            _spinLock.Enter(ref lockTaken);
+            if (_head == _tail)
+            {
+                packet = default;
+                owner = null;
+                return false;
+            }
+
+            int index = _head & _mask;
+            var slot = _slots[index];
+            packet = slot.Packet;
+            owner = slot.Owner;
+
+            _slots[index] = default;
+            _head++;
+            return true;
         }
-
-        int index = head & _mask;
-        var slot = _slots[index];
-        packet = slot.Packet;
-        owner = slot.Owner;
-
-        _slots[index] = default; // clear
-        Volatile.Write(ref _head, head + 1);
-        return true;
+        finally
+        {
+            if (lockTaken) _spinLock.Exit(false);
+        }
     }
 
-    public bool HasItems => Volatile.Read(ref _head) != Volatile.Read(ref _tail);
+    public bool HasItems => _head != _tail;
 
     public void Dispose()
     {

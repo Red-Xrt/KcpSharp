@@ -9,7 +9,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
     private readonly AsyncCapacityReserve _spaceSemaphore;
 
     private readonly IKcpBufferPool _bufferPool;
-    private readonly KcpSendReceiveQueueItemCacheUnsafe _cache;
+
     private readonly int _capacity;
     private readonly int _mss;
 
@@ -40,14 +40,14 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
     private int _waitForSegmentCount;
 
     public KcpSendQueue(IKcpBufferPool bufferPool, KcpConversationUpdateActivation updateActivation, bool stream,
-        int capacity, int mss, KcpSendReceiveQueueItemCacheUnsafe cache)
+        int capacity, int mss)
     {
         _bufferPool = bufferPool;
         _updateActivation = updateActivation;
         _stream = stream;
         _capacity = capacity;
         _mss = mss;
-        _cache = cache;
+
         _mrvtsc = new ManualResetValueTaskSourceCore<bool>
         {
             RunContinuationsAsynchronously = true
@@ -90,7 +90,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                 _queueHead = (_queueHead + 1) % _queueArray.Length;
                 _queueCount--;
             }
-            _cache.Clear();
+
             _transportClosed = true;
         }
 
@@ -815,7 +815,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                 _queueHead = (_queueHead + 1) % _queueArray.Length;
                 _queueCount--;
             }
-            _cache.Clear();
+
 
             _transportClosed = true;
             Interlocked.Exchange(ref _unflushedBytes, 0);

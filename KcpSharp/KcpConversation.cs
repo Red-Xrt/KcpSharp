@@ -12,6 +12,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 {
     private readonly System.Threading.Lock _sndBufLock = new();
     private readonly SemaphoreSlim _flushSemaphore = new(1, 1);
+    private readonly KcpPacketHeader[] _cachedBatchHeaders;
+    private readonly KcpBuffer[] _cachedBatchData;
     private readonly System.Threading.Lock _rcvBufLock = new();
 
     private readonly IKcpBufferPool _bufferPool;
@@ -56,7 +58,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
     private uint _incr;
 
-    private readonly KcpSendReceiveQueueItemCacheUnsafe _sendQueueItemCache;
+
     private readonly KcpSendReceiveQueueItemCacheUnsafe _receiveQueueItemCache;
     private readonly KcpSendQueue _sendQueue;
     private readonly KcpReceiveQueue _receiveQueue;
@@ -87,7 +89,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private CancellationTokenSource? _updateLoopCts;
     private int _disposed;
 
-    private readonly Channel<bool> _flushSignalChannel;
+
 
 
     private KcpRentedBuffer _cachedFlushBuffer;
@@ -224,25 +226,23 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
 
 
-        _flushSignalChannel = Channel.CreateBounded<bool>(new BoundedChannelOptions(1)
-        {
-            FullMode = BoundedChannelFullMode.DropOldest,
-            SingleReader = true,
-            SingleWriter = false
-        });
+
 
         int maxWaitListSize = Math.Max((int)_rcv_wnd, 256);
         _updateActivation = new KcpConversationUpdateActivation((int)_interval, maxWaitListSize);
-        _sendQueueItemCache = new KcpSendReceiveQueueItemCacheUnsafe();
         _receiveQueueItemCache = new KcpSendReceiveQueueItemCacheUnsafe();
         _sendQueue = new KcpSendQueue(_bufferPool, _updateActivation, StreamMode,
             options is null || options.SendQueueSize <= 0
                 ? KcpConversationOptions.SendQueueSizeDefaultValue
-                : options.SendQueueSize, _mss, _sendQueueItemCache);
+                : options.SendQueueSize, _mss);
         _receiveQueue = new KcpReceiveQueue(StreamMode,
             options is null || options.ReceiveQueueSize <= 0
                 ? KcpConversationOptions.ReceiveQueueSizeDefaultValue
                 : options.ReceiveQueueSize, _receiveQueueItemCache);
+        int batchSizeForFlush = Math.Min((int)_snd_wnd, 32);
+        if (batchSizeForFlush < 32) batchSizeForFlush = 32;
+        _cachedBatchHeaders = new KcpPacketHeader[batchSizeForFlush];
+        _cachedBatchData = new KcpBuffer[batchSizeForFlush];
         _ackList = new KcpAcknowledgeList(_sendQueue, (int)_rcv_wnd);
         _cachedAckSnapshotArray = new (uint, uint)[Math.Max(128, (int)_rcv_wnd)];
 
@@ -792,10 +792,9 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 while (nextSn.HasValue && TimeDiff(nextSn.Value, _snd_nxt) < 0 && !TransportClosed)
                 {
                     bool needsFlush = false;
-                    const int BatchSize = 32;
-
-                    var batchHeaders = System.Buffers.ArrayPool<KcpPacketHeader>.Shared.Rent(BatchSize);
-                    var batchData = System.Buffers.ArrayPool<KcpBuffer>.Shared.Rent(BatchSize);
+                    var batchHeaders = _cachedBatchHeaders;
+                    var batchData = _cachedBatchData;
+                    int BatchSize = _cachedBatchHeaders.Length;
                     int batchCount = 0;
 
                     lock (_sndBufLock)
@@ -929,8 +928,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         }
                     }
 
-                    System.Buffers.ArrayPool<KcpPacketHeader>.Shared.Return(batchHeaders);
-                    System.Buffers.ArrayPool<KcpBuffer>.Shared.Return(batchData);
+                    // ArrayPool no longer used, using pre-allocated arrays
 
                     // 2. Flush asynchronously outside the lock
                     if (needsFlush)
@@ -1258,13 +1256,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         }
                         catch (Exception ex)
                         {
-                            rawOwner?.Dispose();
-                            rawOwner = null;
                             if (!HandleFlushException(ex)) return;
-                        }
-                        finally
-                        {
-                            rawOwner?.Dispose();
                         }
                     }
 
@@ -2119,7 +2111,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             updateLoopCts.Cancel();
             updateLoopCts.Dispose();
         }
-        _flushSignalChannel?.Writer.TryComplete();
+
 
         _sendQueue.SetTransportClosed();
         _receiveQueue.SetTransportClosed();
