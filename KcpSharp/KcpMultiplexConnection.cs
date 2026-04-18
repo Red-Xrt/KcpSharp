@@ -104,12 +104,16 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         _transportClosed = true;
         _disposed = true;
         while (!_conversations.IsEmpty)
-            foreach (var id in _conversations.Keys)
+        {
+            var keys = _conversations.Keys.ToArray();
+            if (keys.Length == 0) break;
+            foreach (var id in keys)
                 if (_conversations.TryRemove(id, out var value))
                 {
                     value.Conversation.Dispose();
                     if (_disposeAction is not null) _disposeAction.Invoke(value.State);
                 }
+        }
     }
 
     /// <summary>

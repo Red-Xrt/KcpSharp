@@ -227,7 +227,7 @@ internal static class KcpGlobalTickEngine
 
                                 if (TimeDiff(currentTickMs, entry.NextTick) >= 0)
                                 {
-                                    entry.NextTick = currentTickMs + (uint)entry.Interval + unchecked((uint)Random.Shared.Next(-1, 2));
+                                    entry.NextTick = (uint)(currentTickMs + entry.Interval + Random.Shared.Next(-1, 2));
                                     activation.Notify();
                                 }
 

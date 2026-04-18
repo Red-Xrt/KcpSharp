@@ -134,6 +134,10 @@ public sealed class KcpBuilder
             {
                 _socket.Bind(_localEndPoint);
             }
+            else if (_localEndPoint == null && !_socket.IsBound)
+            {
+                _socket.Bind(new IPEndPoint(_socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0));
+            }
             var transport = KcpSocketTransport.CreateConversation(_socket, _remoteEndPoint, _conversationId.GetValueOrDefault(), _options);
             conversation = transport.Connection;
             transport.Start();

@@ -310,7 +310,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     /// <summary>
     ///     Get whether the transport is marked as closed.
     /// </summary>
-    public bool TransportClosed => Volatile.Read(ref _transportClosedFlag) == 1;
+    public bool TransportClosed => Volatile.Read(ref _transportClosedFlag) == 1 || Volatile.Read(ref _disposed) == 1;
 
     /// <summary>
     ///     Gets the underlying transport.
@@ -792,6 +792,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 long flushStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
                 long flushBudgetTicks = TimeSpan.FromMilliseconds(2).Ticks; // 2ms budget before yielding
 
+                current = GetTimestamp(); // Refresh before data segment flush loop
+
                 while (nextSn.HasValue && TimeDiff(nextSn.Value, _snd_nxt) < 0 && !TransportClosed)
                 {
                     bool needsFlush = false;
@@ -965,6 +967,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             unacknowledged = _rcv_nxt;
+
+            current = GetTimestamp(); // Refresh before probes and keep-alive
 
             // probe window size (if remote window size equals zero)
             if (Volatile.Read(ref _rmt_wnd) == 0)
@@ -1532,6 +1536,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 }
             }
 
+            // Moved the UpdateSendUnacknowledged() and _cwnd/_incr update out of here,
+            // as this runs on the network thread without holding _sndBufLock
+            // or the single-threaded update loop context.
+
             return mutated;
         }
         catch
@@ -1544,7 +1552,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     {
         lock (_rtoLock)
         {
-            UpdateRto(rtt);
+            UpdateRtoCore(rtt);
         }
     }
 
@@ -1726,6 +1734,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 _incr = incr;
             }
 
+            originalBuffer?.Dispose();
             return mutated;
         }
         catch
@@ -1801,23 +1810,29 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         KcpMetrics.RoundTripTime.Record(rtt);
         lock (_rtoLock)
         {
-            if (_rx_srtt == 0)
-            {
-                _rx_srtt = rtt;
-                _rx_rttval = rtt / 2;
-            }
-            else
-            {
-                var delta = rtt - _rx_srtt;
-                if (delta < 0) delta = -delta;
-                _rx_rttval = (3 * _rx_rttval + delta) / 4;
-                _rx_srtt = (7 * _rx_srtt + rtt) / 8;
-                if (_rx_srtt < 1) _rx_srtt = 1;
-            }
-
-            var rto = _rx_srtt + Math.Max((int)_interval, 4 * _rx_rttval);
-            _rx_rto = Math.Clamp((uint)rto, _rx_minrto, IKCP_RTO_MAX);
+            UpdateRtoCore(rtt);
         }
+    }
+
+    // Caller must hold _rtoLock
+    private void UpdateRtoCore(int rtt)
+    {
+        if (_rx_srtt == 0)
+        {
+            _rx_srtt = rtt;
+            _rx_rttval = rtt / 2;
+        }
+        else
+        {
+            var delta = rtt - _rx_srtt;
+            if (delta < 0) delta = -delta;
+            _rx_rttval = (3 * _rx_rttval + delta) / 4;
+            _rx_srtt = (7 * _rx_srtt + rtt) / 8;
+            if (_rx_srtt < 1) _rx_srtt = 1;
+        }
+
+        var rto = _rx_srtt + Math.Max((int)_interval, 4 * _rx_rttval);
+        _rx_rto = Math.Clamp((uint)rto, _rx_minrto, IKCP_RTO_MAX);
     }
 
     private bool HandleAck(uint serialNumber, out int bytesFreed)

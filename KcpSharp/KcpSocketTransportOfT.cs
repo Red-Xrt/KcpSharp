@@ -637,7 +637,7 @@ private async Task RunReceiveLoopLinuxAsync()
         KcpSocketTransportNative.mmsghdr[] msgvecPool = ArrayPool<KcpSocketTransportNative.mmsghdr>.Shared.Rent(maxBatchSize);
         KcpSocketTransportNative.iovec[] iovecsPool = ArrayPool<KcpSocketTransportNative.iovec>.Shared.Rent(maxBatchSize);
         byte[] addressBuffer = ArrayPool<byte>.Shared.Rent(maxBatchSize * 128);
-        byte[] rxSlab = GC.AllocateUninitializedArray<byte>(maxBatchSize * 65536, pinned: true);
+        byte[] rxSlab = ArrayPool<byte>.Shared.Rent(maxBatchSize * 65536);
         Memory<byte>[] buffers = new Memory<byte>[maxBatchSize];
 
         for (int i = 0; i < maxBatchSize; i++)
@@ -703,24 +703,26 @@ private async Task RunReceiveLoopLinuxAsync()
                     fixed (KcpSocketTransportNative.iovec* pIovecs = iovecsPool)
                     fixed (KcpSocketTransportNative.mmsghdr* pMsgvec = msgvecPool)
                     {
-                        for (int i = 0; i < maxBatchSize; i++)
+                        fixed (byte* pRxSlab = rxSlab)
                         {
-                            ref byte firstByte = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(buffers[i].Span);
-                            pIovecs[i].iov_base = System.Runtime.CompilerServices.Unsafe.AsPointer(ref firstByte);
-                            pIovecs[i].iov_len = 65536;
+                            for (int i = 0; i < maxBatchSize; i++)
+                            {
+                                pIovecs[i].iov_base = pRxSlab + (i * 65536);
+                                pIovecs[i].iov_len = 65536;
 
-                            byte* pAddr = pAddrStr + (i * 128);
-                            pMsgvec[i].msg_hdr.msg_name = pAddr;
-                            pMsgvec[i].msg_hdr.msg_namelen = 128;
-                            pMsgvec[i].msg_hdr.msg_iov = pIovecs + i;
-                            pMsgvec[i].msg_hdr.msg_iovlen = 1;
-                            pMsgvec[i].msg_hdr.msg_control = null;
-                            pMsgvec[i].msg_hdr.msg_controllen = 0;
-                            pMsgvec[i].msg_hdr.msg_flags = 0;
+                                byte* pAddr = pAddrStr + (i * 128);
+                                pMsgvec[i].msg_hdr.msg_name = pAddr;
+                                pMsgvec[i].msg_hdr.msg_namelen = 128;
+                                pMsgvec[i].msg_hdr.msg_iov = pIovecs + i;
+                                pMsgvec[i].msg_hdr.msg_iovlen = 1;
+                                pMsgvec[i].msg_hdr.msg_control = null;
+                                pMsgvec[i].msg_hdr.msg_controllen = 0;
+                                pMsgvec[i].msg_hdr.msg_flags = 0;
+                            }
+
+                            // MSG_WAITFORONE = 0x10000 -> Block until at least 1 packet is ready
+                            ret = KcpSocketTransportNative.recvmmsg(sockfd, pMsgvec, (uint)maxBatchSize, 0x10000, null);
                         }
-
-                        // MSG_WAITFORONE = 0x10000 -> Block until at least 1 packet is ready
-                        ret = KcpSocketTransportNative.recvmmsg(sockfd, pMsgvec, (uint)maxBatchSize, 0x10000, null);
                         if (ret < 0)
                         {
                             int error = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
@@ -826,6 +828,7 @@ private async Task RunReceiveLoopLinuxAsync()
             ArrayPool<byte>.Shared.Return(addressBuffer);
             ArrayPool<KcpSocketTransportNative.mmsghdr>.Shared.Return(msgvecPool);
             ArrayPool<KcpSocketTransportNative.iovec>.Shared.Return(iovecsPool);
+            ArrayPool<byte>.Shared.Return(rxSlab);
         }
     }
 
