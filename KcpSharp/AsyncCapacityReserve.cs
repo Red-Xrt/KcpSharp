@@ -119,7 +119,7 @@ internal sealed class AsyncCapacityReserve : IDisposable
                 return new ValueTask<bool>(Task.FromException<bool>(new ObjectDisposedException(nameof(AsyncCapacityReserve))));
 
             // Double-check inside lock
-            if (TryReserve(count))
+            if (TryReserveInternal(count))
                 return new ValueTask<bool>(true);
 
             var waiter = WaiterPool.Rent();

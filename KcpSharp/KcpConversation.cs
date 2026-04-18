@@ -37,7 +37,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
     private int _rx_rttval;
     private int _rx_srtt;
-    private uint _rx_rto;
+    private volatile uint _rx_rto;
     private readonly uint _rx_minrto;
 
     private readonly uint _snd_wnd;
@@ -240,7 +240,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             options is null || options.ReceiveQueueSize <= 0
                 ? KcpConversationOptions.ReceiveQueueSizeDefaultValue
                 : options.ReceiveQueueSize, _receiveQueueItemCache);
-        int batchSizeForFlush = Math.Max((int)_snd_wnd, 32);
+        int batchSizeForFlush = Math.Min(Math.Max((int)_snd_wnd, 32), 256);
         _cachedBatchHeaders = new KcpPacketHeader[batchSizeForFlush];
         _cachedBatchData = new KcpBuffer[batchSizeForFlush];
         _ackList = new KcpAcknowledgeList(_sendQueue, (int)_rcv_wnd);
@@ -1281,6 +1281,9 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
             try
             {
+                // Refresh current timestamp before flushing, as the drain loop above may have yielded
+                current = GetTimestamp();
+
                 if (anyUpdate) await UpdateCoreAsync(cancellationToken, current).ConfigureAwait(false);
 
                 // Trigger the unified flush loop locally if any updates happened or ACKs pending
@@ -1725,10 +1728,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
             return mutated;
         }
-        catch
-        {
-            throw;
-        }
+
     }
 
     private bool HandleUnacknowledged(uint una)
