@@ -75,7 +75,8 @@ internal sealed class AsyncCapacityReserve : IDisposable
     {
         lock (_syncRoot)
         {
-            _hasWaiters = 1;
+            // _hasWaiters is already 1 when we arrive here (checked by caller).
+            // It is correctly computed and set at the end of this method.
             if (_disposed) return;
 
             while (_waiters.First is not null)
