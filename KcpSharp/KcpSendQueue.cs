@@ -26,7 +26,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
     private bool _activeWait;
 
-    internal bool IsUpdateLoopActive() => !_transportClosed && !_disposed;
+    internal bool IsTransportClosed() => _transportClosed || _disposed;
 
     private CancellationTokenRegistration _cancellationRegistration;
     private CancellationToken _cancellationToken;

@@ -1104,7 +1104,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 incr = (uint)_mss;
             }
 
-            if (updatedCwnd > Volatile.Read(ref _rmt_wnd)) updatedCwnd = Volatile.Read(ref _rmt_wnd);
+            var rmt_wnd = Volatile.Read(ref _rmt_wnd);
+            if (updatedCwnd > rmt_wnd) updatedCwnd = rmt_wnd;
 
             _cwnd = updatedCwnd;
             _incr = incr;
@@ -1540,6 +1541,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             // as this runs on the network thread without holding _sndBufLock
             // or the single-threaded update loop context.
 
+            if (mutated)
+            {
+                mutated = UpdateSendUnacknowledged() | mutated;
+            }
+
             return mutated;
         }
         catch
@@ -1569,7 +1575,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             : KcpGlobalVars.HEADER_LENGTH_WITHOUT_CONVID;
         int packetOffset = 0;
 
-        var prev_una = _snd_una;
+        uint prev_una;
+        lock (_sndBufLock)
+        {
+            prev_una = _snd_una;
+        }
+
         uint maxack = 0, latest_ts = 0;
         var flag = false;
         var mutated = false;

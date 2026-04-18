@@ -97,7 +97,7 @@ internal sealed class KcpAcknowledgeList
         // It's guaranteed by caller (SetTransportClosed) that the update loop is already terminated,
         // so no concurrent Add calls can happen.
         System.Diagnostics.Debug.Assert(
-            !_sendQueue.IsUpdateLoopActive(),
+            _sendQueue.IsTransportClosed(),
             "Clear should only be called when the update loop is terminated and no concurrent Add can happen."
         );
 

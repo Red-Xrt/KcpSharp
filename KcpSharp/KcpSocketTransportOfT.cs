@@ -283,7 +283,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                                     msgvecPtr[i].msg_len = 0;
                                 }
 
-                                int sockfd = _socket.Handle.ToInt32();
+                                int sockfd = (int)_socket.Handle;
                                 int sent = 0;
                                 while (sent < countToFlush)
                                 {
@@ -651,9 +651,26 @@ private async Task RunReceiveLoopLinuxAsync()
 
         try
         {
-            int sockfd = _socket.Handle.ToInt32();
+            int sockfd = (int)_socket.Handle;
             int emptyPollCount = 0;
             int currentPollTimeout = 1000; // 1ms active
+
+            unsafe
+            {
+                fixed (byte* pAddrStr = addressBuffer)
+                fixed (KcpSocketTransportNative.iovec* pIovecs = iovecsPool)
+                fixed (KcpSocketTransportNative.mmsghdr* pMsgvec = msgvecPool)
+                {
+                    for (int i = 0; i < maxBatchSize; i++)
+                    {
+                        pIovecs[i].iov_len = 65536;
+                        pMsgvec[i].msg_hdr.msg_iovlen = 1;
+                        pMsgvec[i].msg_hdr.msg_control = null;
+                        pMsgvec[i].msg_hdr.msg_controllen = 0;
+                        pMsgvec[i].msg_hdr.msg_flags = 0;
+                    }
+                }
+            }
 
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -708,16 +725,11 @@ private async Task RunReceiveLoopLinuxAsync()
                             for (int i = 0; i < maxBatchSize; i++)
                             {
                                 pIovecs[i].iov_base = pRxSlab + (i * 65536);
-                                pIovecs[i].iov_len = 65536;
 
                                 byte* pAddr = pAddrStr + (i * 128);
                                 pMsgvec[i].msg_hdr.msg_name = pAddr;
                                 pMsgvec[i].msg_hdr.msg_namelen = 128;
                                 pMsgvec[i].msg_hdr.msg_iov = pIovecs + i;
-                                pMsgvec[i].msg_hdr.msg_iovlen = 1;
-                                pMsgvec[i].msg_hdr.msg_control = null;
-                                pMsgvec[i].msg_hdr.msg_controllen = 0;
-                                pMsgvec[i].msg_hdr.msg_flags = 0;
                             }
 
                             // MSG_WAITFORONE = 0x10000 -> Block until at least 1 packet is ready
