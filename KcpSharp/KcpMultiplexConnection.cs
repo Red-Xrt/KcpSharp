@@ -92,6 +92,12 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
     }
 
     /// <inheritdoc />
+    public async ValueTask DisposeAsync()
+    {
+        Dispose();
+        await System.Threading.Tasks.Task.CompletedTask;
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposeFlag, 1) == 1) return;

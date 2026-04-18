@@ -6,7 +6,7 @@ namespace KcpSharp;
 ///     Defines an internal interface for batched KCP transport operations.
 ///     Implementations must be thread-safe as batch operations can be called concurrently.
 /// </summary>
-internal interface IKcpBatchTransport
+public interface IKcpBatchTransport
 {
     /// <summary>
     ///     Tries to get a memory slice in the batch buffer for the required size, commits it with the target endpoint,
@@ -32,7 +32,7 @@ internal interface IKcpBatchTransport
     int BatchCapacity { get; }
 }
 
-internal interface IKcpBatchTransport2 : IKcpBatchTransport
+public interface IKcpBatchTransport2 : IKcpBatchTransport
 {
     bool AnyPacketCommitted { get; }
 }

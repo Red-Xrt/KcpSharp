@@ -47,9 +47,7 @@ internal struct KcpBuffer
         {
             buffer.DataRegion.Span.CopyTo(_memory.Span.Slice(Length));
             combined = new KcpBuffer(_owner, _memory, Length + buffer.Length);
-            // Transfer ownership conceptually by clearing the owner of the current instance
-            // We enforce single ownership by nullifying the owner in the source instance.
-            _owner = null;
+            _owner = null; // Enforce single ownership
             return true;
         }
 

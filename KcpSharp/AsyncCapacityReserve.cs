@@ -65,13 +65,17 @@ internal sealed class AsyncCapacityReserve : IDisposable
                 break;
         }
 
-        CheckWaiters();
+        if (_hasWaiters == 1)
+        {
+            CheckWaiters();
+        }
     }
 
     private void CheckWaiters()
     {
         lock (_syncRoot)
         {
+            _hasWaiters = 1;
             if (_disposed) return;
 
             while (_waiters.First is not null)
@@ -110,11 +114,12 @@ internal sealed class AsyncCapacityReserve : IDisposable
 
         lock (_syncRoot)
         {
+            _hasWaiters = 1;
             if (_disposed)
                 return new ValueTask<bool>(Task.FromException<bool>(new ObjectDisposedException(nameof(AsyncCapacityReserve))));
 
             // Double-check inside lock
-            if (TryReserve(count))
+            if (TryReserveInternal(count))
                 return new ValueTask<bool>(true);
 
             var waiter = WaiterPool.Rent();
@@ -135,6 +140,7 @@ internal sealed class AsyncCapacityReserve : IDisposable
             {
                 _waiters.Remove(waiter.Node);
                 waiter.Node = null;
+                _hasWaiters = _waiters.First is not null ? 1 : 0;
                 return true;
             }
 
@@ -146,6 +152,7 @@ internal sealed class AsyncCapacityReserve : IDisposable
     {
         lock (_syncRoot)
         {
+            _hasWaiters = 1;
             if (_disposed) return;
             _disposed = true;
 

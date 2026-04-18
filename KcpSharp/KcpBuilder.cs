@@ -15,6 +15,8 @@ public sealed class KcpBuilder
     private Func<Exception, KcpConversation, object?, bool>? _exceptionHandler;
     private object? _exceptionHandlerState;
     private uint? _conversationId;
+    private int _maxBatchSize = 32;
+    private KcpKeepAliveOptions? _keepAliveOptions;
 
     /// <summary>
     ///     Initialize a builder for a KcpConversation.

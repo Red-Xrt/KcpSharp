@@ -119,11 +119,6 @@ internal static class KcpGlobalTickEngine
             // If we miss the actual slot because it was processed and moved, the activation will simply
             // be safely skipped by the tick loop later because it will no longer be found in `s_activations`.
             // Crucially, we do NOT dispose `activation` here; it's handled by its own lifecycle (e.g. `KcpConversationUpdateActivation.Dispose`).
-            int slot = entry.CurrentWheelSlot;
-            lock (s_wheelLocks[slot])
-            {
-                s_wheel[slot].Remove(activation);
-            }
         }
     }
 
