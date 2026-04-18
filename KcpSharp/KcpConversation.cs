@@ -1728,7 +1728,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
             return mutated;
         }
-
+        catch
+        {
+            return mutated;
+        }
     }
 
     private bool HandleUnacknowledged(uint una)
