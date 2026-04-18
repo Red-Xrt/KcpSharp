@@ -821,12 +821,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             Interlocked.Exchange(ref _unflushedBytes, 0);
 
             // Wake up waiters
-            int currentCount = _spaceSemaphore.CurrentCount;
-            int toRelease = _capacity - currentCount;
-            if (toRelease > 0)
-            {
-                try { _spaceSemaphore.Release(toRelease); } catch (ObjectDisposedException) { } catch (System.Threading.SemaphoreFullException) { }
-            }
+            try { _spaceSemaphore.Dispose(); } catch (ObjectDisposedException) { }
         }
 
         if (executeSetException)

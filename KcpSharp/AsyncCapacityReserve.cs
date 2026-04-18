@@ -75,6 +75,7 @@ internal sealed class AsyncCapacityReserve : IDisposable
     {
         lock (_syncRoot)
         {
+            _hasWaiters = 1;
             if (_disposed) return;
 
             while (_waiters.First is not null)
@@ -113,6 +114,7 @@ internal sealed class AsyncCapacityReserve : IDisposable
 
         lock (_syncRoot)
         {
+            _hasWaiters = 1;
             if (_disposed)
                 return new ValueTask<bool>(Task.FromException<bool>(new ObjectDisposedException(nameof(AsyncCapacityReserve))));
 
@@ -138,6 +140,7 @@ internal sealed class AsyncCapacityReserve : IDisposable
             {
                 _waiters.Remove(waiter.Node);
                 waiter.Node = null;
+                _hasWaiters = _waiters.First is not null ? 1 : 0;
                 return true;
             }
 
@@ -149,6 +152,7 @@ internal sealed class AsyncCapacityReserve : IDisposable
     {
         lock (_syncRoot)
         {
+            _hasWaiters = 1;
             if (_disposed) return;
             _disposed = true;
 

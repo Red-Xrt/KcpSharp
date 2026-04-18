@@ -647,11 +647,7 @@ private async Task RunReceiveLoopLinuxAsync()
 
         IPEndPoint? cachedEndpoint = null;
         ValueTask[] tasks = new ValueTask[maxBatchSize];
-        SocketAddress[] socketAddressesPool = new SocketAddress[maxBatchSize];
-        for (int i = 0; i < maxBatchSize; i++)
-        {
-            socketAddressesPool[i] = new SocketAddress(_socket.AddressFamily, 128); // Max typical size
-        }
+
 
         try
         {
@@ -745,9 +741,8 @@ private async Task RunReceiveLoopLinuxAsync()
                             int addrLen = (int)pMsgvec[i].msg_hdr.msg_namelen;
                             byte* pAddr = pAddrStr + (i * 128);
 
-                            SocketAddress receivedAddress = socketAddressesPool[i];
-                            // Update size if it changed (though SocketAddress Size is internal/initonly in some frameworks,
-                            // we just overwrite the existing bytes up to addrLen and use it)
+                            // Create a correctly sized SocketAddress to ensure the endpoint cache works.
+                            SocketAddress receivedAddress = new SocketAddress(_socket.AddressFamily, addrLen);
                             for (int j = 0; j < addrLen; j++)
                             {
                                 receivedAddress[j] = pAddr[j];

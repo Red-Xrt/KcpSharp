@@ -11,6 +11,7 @@ namespace KcpSharp;
 public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionProducer<KcpConversation>, IKcpPacketSink, IAsyncDisposable
 {
     private readonly System.Threading.Lock _sndBufLock = new();
+    private readonly System.Threading.Lock _rtoLock = new();
     private readonly SemaphoreSlim _flushSemaphore = new(1, 1);
     private readonly KcpPacketHeader[] _cachedBatchHeaders;
     private readonly KcpBuffer[] _cachedBatchData;
@@ -239,8 +240,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             options is null || options.ReceiveQueueSize <= 0
                 ? KcpConversationOptions.ReceiveQueueSizeDefaultValue
                 : options.ReceiveQueueSize, _receiveQueueItemCache);
-        int batchSizeForFlush = Math.Min((int)_snd_wnd, 32);
-        if (batchSizeForFlush < 32) batchSizeForFlush = 32;
+        int batchSizeForFlush = Math.Max((int)_snd_wnd, 32);
         _cachedBatchHeaders = new KcpPacketHeader[batchSizeForFlush];
         _cachedBatchData = new KcpBuffer[batchSizeForFlush];
         _ackList = new KcpAcknowledgeList(_sendQueue, (int)_rcv_wnd);
@@ -695,16 +695,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 int batchSize = Math.Min(availableSlots, _flushDequeueBuffer.Length);
                 var dequeueBufferArray = _flushDequeueBuffer;
 
-                var dequeuedCount = _sendQueue.TryDequeueBatch(dequeueBufferArray.AsSpan(0, batchSize), batchSize);
+                int dequeuedCount = 0;
                 int processedCount = 0;
 
                 try
                 {
-                    if (dequeuedCount == 0)
-                    {
-                        break;
-                    }
-
                     lock (_sndBufLock)
                     {
                         if (TransportClosed)
@@ -712,14 +707,22 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                             return;
                         }
 
-                        // Re-verify inside lock
+                        // Re-verify inside lock before popping to avoid data loss
                         int actualAvailable = TimeDiff(_snd_una + cwnd, _snd_nxt);
-                        int toProcess = Math.Min(dequeuedCount, actualAvailable);
+                        int toProcess = Math.Min(batchSize, actualAvailable);
 
                         if (toProcess <= 0)
                         {
                             break;
                         }
+
+                        dequeuedCount = _sendQueue.TryDequeueBatch(dequeueBufferArray.AsSpan(0, toProcess), toProcess);
+                        if (dequeuedCount == 0)
+                        {
+                            break;
+                        }
+
+                        toProcess = dequeuedCount; // we only process what we successfully pulled
 
                         for (int i = 0; i < toProcess; i++)
                         {
@@ -990,7 +993,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             // flush window probing command
-            if (((KcpProbeType)_probe & KcpProbeType.AskSend) != 0)
+            var processedProbe = (KcpProbeType)System.Threading.Interlocked.Exchange(ref _probe, 0);
+            if ((processedProbe & KcpProbeType.AskSend) != 0)
             {
                 if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
                 {
@@ -1008,7 +1012,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             // flush window probing response
-            if (((KcpProbeType)_probe & KcpProbeType.AskTell) != 0)
+            if ((processedProbe & KcpProbeType.AskTell) != 0)
             {
                 if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
                 {
@@ -1058,7 +1062,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 buffer.Span.Slice(0, size).Clear();
             }
 
-            System.Threading.Interlocked.Exchange(ref _probe, 0);
+            // _probe was cleared securely at the start of probe evaluation
 
             if (batch is not null)
             {
@@ -1439,20 +1443,26 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         try
         {
+            if (_id.HasValue)
+            {
+                if (packet.Length < 4 || System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(packet) != _id.GetValueOrDefault())
+                    return mutated;
+                packet = packet.Slice(4);
+            }
+            int segmentHeaderSize = 20;
+
             while (true)
             {
-                if (packet.Length < packetHeaderSize) break;
+                if (packet.Length < segmentHeaderSize) break;
 
                 KcpPacketHeader header;
                 int length;
                 try
                 {
-                    int offset = _id.HasValue ? 4 : 0;
-                    if (_id.HasValue && System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(packet) != _id.GetValueOrDefault()) return mutated;
-                    header = KcpPacketHeader.Parse(packet.Slice(offset));
-                    length = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(offset + 16));
+                    header = KcpPacketHeader.Parse(packet);
+                    length = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(packet.Slice(16));
 
-                    packet = packet.Slice(packetHeaderSize);
+                    packet = packet.Slice(segmentHeaderSize);
                     if ((uint)length > (uint)packet.Length) return mutated;
                 }
                 catch
@@ -1529,7 +1539,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
     private void UpdateRtoThreadSafe(int rtt)
     {
-        UpdateRto(rtt);
+        lock (_rtoLock)
+        {
+            UpdateRto(rtt);
+        }
     }
 
     private void UpdateProbeThreadSafe(KcpProbeType flags)
@@ -1783,22 +1796,25 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private void UpdateRto(int rtt)
     {
         KcpMetrics.RoundTripTime.Record(rtt);
-        if (_rx_srtt == 0)
+        lock (_rtoLock)
         {
-            _rx_srtt = rtt;
-            _rx_rttval = rtt / 2;
-        }
-        else
-        {
-            var delta = rtt - _rx_srtt;
-            if (delta < 0) delta = -delta;
-            _rx_rttval = (3 * _rx_rttval + delta) / 4;
-            _rx_srtt = (7 * _rx_srtt + rtt) / 8;
-            if (_rx_srtt < 1) _rx_srtt = 1;
-        }
+            if (_rx_srtt == 0)
+            {
+                _rx_srtt = rtt;
+                _rx_rttval = rtt / 2;
+            }
+            else
+            {
+                var delta = rtt - _rx_srtt;
+                if (delta < 0) delta = -delta;
+                _rx_rttval = (3 * _rx_rttval + delta) / 4;
+                _rx_srtt = (7 * _rx_srtt + rtt) / 8;
+                if (_rx_srtt < 1) _rx_srtt = 1;
+            }
 
-        var rto = _rx_srtt + Math.Max((int)_interval, 4 * _rx_rttval);
-        _rx_rto = Math.Clamp((uint)rto, _rx_minrto, IKCP_RTO_MAX);
+            var rto = _rx_srtt + Math.Max((int)_interval, 4 * _rx_rttval);
+            _rx_rto = Math.Clamp((uint)rto, _rx_minrto, IKCP_RTO_MAX);
+        }
     }
 
     private bool HandleAck(uint serialNumber, out int bytesFreed)
@@ -2174,8 +2190,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         try
         {
             if (_updateLoopTask != null)
-                await Task.WhenAny(_updateLoopTask, Task.Delay(2000)).ConfigureAwait(false);
-
+            {
+                // We rely on SetTransportClosed() cancelling `_updateLoopCts`, unblocking network IO.
+                // Await completely to guarantee safe disposal of the pre-allocated buffers without use-after-free corruption.
+                await _updateLoopTask.ConfigureAwait(false);
+            }
         }
         catch { }
 
