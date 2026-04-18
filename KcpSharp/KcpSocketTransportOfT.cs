@@ -621,9 +621,9 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
 private async Task RunReceiveLoopLinuxAsync()
     {
-        // Hop off the threadpool to run a blocking recvmmsg loop.
-        // Task.Yield() ensures we hop onto a clean thread-pool thread to become a dedicated receiver.
-        await Task.Yield();
+        // Runs on the dedicated LongRunning thread created by Task.Factory.StartNew.
+        // Do NOT await Task.Yield() here — that posts the continuation to the shared
+        // thread pool, defeating LongRunning and blocking pool threads with Socket.Poll().
 
         var cancellationToken = _cts?.Token ?? new CancellationToken(true);
         IKcpConversation? connection = _connection;

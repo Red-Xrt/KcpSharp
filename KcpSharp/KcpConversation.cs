@@ -1388,25 +1388,29 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             bool hasPush = false;
-                        var currentSpan = packetSpan;
-            while (currentSpan.Length >= 20)
             {
-                KcpCommand cmd = (KcpCommand)currentSpan[0];
-                int pktLength = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(currentSpan.Slice(16));
+                // Scan from the raw packet.Span so each segment's conv ID is handled correctly.
+                // When _id.HasValue, every KCP segment is prefixed with a 4-byte conv ID.
+                ReadOnlySpan<byte> scanSpan = packet.Span;
+                int convIdLen = _id.HasValue ? 4 : 0;
 
-                if (cmd == KcpCommand.Push)
+                while (scanSpan.Length >= convIdLen + 20)
                 {
-                    hasPush = true;
-                    break;
-                }
+                    if (convIdLen > 0)
+                    {
+                        if (System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(scanSpan) != _id.GetValueOrDefault())
+                            break; // conv ID mismatch — malformed remainder, stop scan
+                        scanSpan = scanSpan.Slice(convIdLen);
+                    }
 
-                if (currentSpan.Length >= 20 + pktLength)
-                {
-                    currentSpan = currentSpan.Slice(20 + pktLength);
-                }
-                else
-                {
-                    break;
+                    KcpCommand cmd = (KcpCommand)scanSpan[0];
+                    if (cmd == KcpCommand.Push) { hasPush = true; break; }
+
+                    int segLen = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(scanSpan.Slice(16));
+                    if (segLen < 0 || scanSpan.Length < 20 + segLen)
+                        break;
+
+                    scanSpan = scanSpan.Slice(20 + segLen);
                 }
             }
 
@@ -1459,8 +1463,18 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
             int segmentHeaderSize = 20;
 
+            bool firstSegment = true;
             while (true)
             {
+                if (!firstSegment && _id.HasValue)
+                {
+                    if (packet.Length < 4) break;
+                    if (System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(packet) != _id.GetValueOrDefault())
+                        break;
+                    packet = packet.Slice(4);
+                }
+                firstSegment = false;
+
                 if (packet.Length < segmentHeaderSize) break;
 
                 KcpPacketHeader header;
