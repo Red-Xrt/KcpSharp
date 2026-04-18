@@ -26,6 +26,8 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
     private bool _activeWait;
 
+    internal bool IsTransportClosed() => _transportClosed || _disposed;
+
     private CancellationTokenRegistration _cancellationRegistration;
     private CancellationToken _cancellationToken;
     private bool _disposed;
@@ -758,10 +760,17 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
     /// <param name="bytes">The total bytes sent or acknowledged.</param>
     public void SubtractUnflushedBytes(long bytes)
     {
-        var unflushedBytes = Interlocked.Add(ref _unflushedBytes, -bytes);
-        if (unflushedBytes <= 0)
+        long initialValue, computedValue;
+        do
         {
+            initialValue = Interlocked.Read(ref _unflushedBytes);
+            computedValue = initialValue - bytes;
+            if (computedValue < 0) computedValue = 0;
+        }
+        while (initialValue != Interlocked.CompareExchange(ref _unflushedBytes, computedValue, initialValue));
 
+        if (computedValue <= 0)
+        {
             bool executeSetResult = false;
             lock (_syncRoot)
             {

@@ -100,15 +100,17 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
             if (_activeWait)
                 return new ValueTask<KcpConversationUpdateNotification>(Task.FromException<KcpConversationUpdateNotification>(ThrowHelper.NewConcurrentReceiveException()));
 
+            if (_ringBuffer.TryDequeue(out var packet, out var bufferOwner))
+            {
+                bool hasTimer = _notificationPending;
+                _notificationPending = false;
+                return new ValueTask<KcpConversationUpdateNotification>(new KcpConversationUpdateNotification(packet, bufferOwner, !hasTimer));
+            }
+
             if (_notificationPending)
             {
                 _notificationPending = false;
                 return new ValueTask<KcpConversationUpdateNotification>(new KcpConversationUpdateNotification(null, false));
-            }
-
-            if (_ringBuffer.TryDequeue(out var packet, out var bufferOwner))
-            {
-                return new ValueTask<KcpConversationUpdateNotification>(new KcpConversationUpdateNotification(packet, bufferOwner, true));
             }
 
             _activeWait = true;
