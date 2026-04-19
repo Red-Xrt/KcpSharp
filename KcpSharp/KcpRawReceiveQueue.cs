@@ -1,79 +1,69 @@
+using System;
 using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Threading.Tasks.Sources;
 
 namespace KcpSharp;
 
 internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationReceiveResult>, IDisposable
 {
-    private readonly System.Threading.Lock _syncRoot = new();
-
     private readonly IKcpBufferPool _bufferPool;
     private readonly int _capacity;
-    private readonly LinkedList<KcpBuffer> _queue;
-    private readonly LinkedList<KcpBuffer> _recycled;
+
+    private readonly KcpBuffer[] _queue;
+    private int _head;
+    private int _tail;
+    private int _count;
+
+    private readonly System.Threading.Lock _syncRoot = new();
+    private ManualResetValueTaskSourceCore<KcpConversationReceiveResult> _mrvtsc;
 
     private bool _activeWait;
-    private Memory<byte> _buffer;
-    private bool _bufferProvided;
-    private CancellationTokenRegistration _cancellationRegistration;
-    private CancellationToken _cancellationToken;
-    private bool _disposed;
-    private ManualResetValueTaskSourceCore<KcpConversationReceiveResult> _mrvtsc;
     private bool _signaled;
+    private bool _bufferProvided;
+    private Memory<byte> _buffer;
+    private CancellationToken _cancellationToken;
+    private CancellationTokenRegistration _cancellationRegistration;
 
     private bool _transportClosed;
+    private bool _disposed;
 
-    internal KcpRawReceiveQueue(IKcpBufferPool bufferPool, int capacity)
+    public KcpRawReceiveQueue(IKcpBufferPool bufferPool, int capacity)
     {
         _bufferPool = bufferPool;
         _capacity = capacity;
-        _queue = new LinkedList<KcpBuffer>();
-        _recycled = new LinkedList<KcpBuffer>();
+
+        int pow2Capacity = 16;
+        while (pow2Capacity <= capacity) pow2Capacity *= 2;
+        _queue = new KcpBuffer[pow2Capacity];
+
+        _mrvtsc = new ManualResetValueTaskSourceCore<KcpConversationReceiveResult>();
     }
 
     public void Dispose()
     {
-        bool executeSetResult = false;
         lock (_syncRoot)
         {
             if (_disposed) return;
-            if (_activeWait && !_signaled)
-            {
-                ClearPreviousOperation();
-                executeSetResult = true;
-            }
-
-            var node = _queue.First;
-            while (node is not null)
-            {
-                node.ValueRef.Release();
-                node = node.Next;
-            }
-
-            _queue.Clear();
-            _recycled.Clear();
+            SetTransportClosed();
             _disposed = true;
-            _transportClosed = true;
-        }
-
-        if (executeSetResult)
-        {
-            _mrvtsc.SetResult(default);
         }
     }
 
     KcpConversationReceiveResult IValueTaskSource<KcpConversationReceiveResult>.GetResult(short token)
     {
         _cancellationRegistration.Dispose();
+
         try
         {
             return _mrvtsc.GetResult(token);
         }
         finally
         {
-            _mrvtsc.Reset();
             lock (_syncRoot)
             {
+                _mrvtsc.Reset();
                 _activeWait = false;
                 _signaled = false;
                 _cancellationRegistration = default;
@@ -103,14 +93,13 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
             }
 
             if (_activeWait) ThrowHelper.ThrowConcurrentReceiveException();
-            var first = _queue.First;
-            if (first is null)
+            if (_count == 0)
             {
                 result = new KcpConversationReceiveResult(0);
                 return false;
             }
 
-            result = new KcpConversationReceiveResult(first.ValueRef.Length);
+            result = new KcpConversationReceiveResult(_queue[_head].Length);
             return true;
         }
     }
@@ -128,10 +117,9 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
                 return new ValueTask<KcpConversationReceiveResult>(
                     Task.FromCanceled<KcpConversationReceiveResult>(cancellationToken));
 
-            var first = _queue.First;
-            if (first is not null)
+            if (_count > 0)
                 return new ValueTask<KcpConversationReceiveResult>(
-                    new KcpConversationReceiveResult(first.ValueRef.Length));
+                    new KcpConversationReceiveResult(_queue[_head].Length));
 
             _activeWait = true;
             Debug.Assert(!_signaled);
@@ -159,23 +147,22 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
             }
 
             if (_activeWait) ThrowHelper.ThrowConcurrentReceiveException();
-            var first = _queue.First;
-            if (first is null)
+            if (_count == 0)
             {
                 result = new KcpConversationReceiveResult(0);
                 return false;
             }
 
-            ref var source = ref first.ValueRef;
+            ref var source = ref _queue[_head];
             if (buffer.Length < source.Length) ThrowHelper.ThrowBufferTooSmall();
 
             source.DataRegion.Span.CopyTo(buffer);
             result = new KcpConversationReceiveResult(source.Length);
 
-            _queue.RemoveFirst();
             source.Release();
             source = default;
-            _recycled.AddLast(first);
+            _head = (_head + 1) & (_queue.Length - 1);
+            _count--;
 
             return true;
         }
@@ -195,21 +182,20 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
                 return new ValueTask<KcpConversationReceiveResult>(
                     Task.FromCanceled<KcpConversationReceiveResult>(cancellationToken));
 
-            var first = _queue.First;
-            if (first is not null)
+            if (_count > 0)
             {
-                ref var source = ref first.ValueRef;
+                ref var source = ref _queue[_head];
                 var length = source.Length;
                 if (buffer.Length < source.Length)
                     return new ValueTask<KcpConversationReceiveResult>(
                         Task.FromException<KcpConversationReceiveResult>(
                             ThrowHelper.NewBufferTooSmallForBufferArgument()));
-                _queue.Remove(first);
 
                 source.DataRegion.CopyTo(buffer);
                 source.Release();
                 source = default;
-                _recycled.AddLast(first);
+                _head = (_head + 1) & (_queue.Length - 1);
+                _count--;
 
                 return new ValueTask<KcpConversationReceiveResult>(new KcpConversationReceiveResult(length));
             }
@@ -290,20 +276,23 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
         {
             if (_transportClosed || _disposed) return;
 
-            var queueSize = _queue.Count;
-            if (queueSize > 0 || !_activeWait)
+            if (_count > 0 || !_activeWait)
             {
-                if (queueSize >= _capacity) return;
+                if (_count >= _capacity) return;
 
                 var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(buffer.Length, false));
-                _queue.AddLast(AllocateNode(KcpBuffer.CreateFromSpan(owner, buffer)));
+                _queue[_tail] = KcpBuffer.CreateFromSpan(owner, buffer);
+                _tail = (_tail + 1) & (_queue.Length - 1);
+                _count++;
                 return;
             }
 
             if (!_bufferProvided)
             {
                 var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(buffer.Length, false));
-                _queue.AddLast(AllocateNode(KcpBuffer.CreateFromSpan(owner, buffer)));
+                _queue[_tail] = KcpBuffer.CreateFromSpan(owner, buffer);
+                _tail = (_tail + 1) & (_queue.Length - 1);
+                _count++;
 
                 ClearPreviousOperation();
                 resultToSet = new KcpConversationReceiveResult(buffer.Length);
@@ -312,7 +301,9 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
             else if (buffer.Length > _buffer.Length)
             {
                 var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(buffer.Length, false));
-                _queue.AddLast(AllocateNode(KcpBuffer.CreateFromSpan(owner, buffer)));
+                _queue[_tail] = KcpBuffer.CreateFromSpan(owner, buffer);
+                _tail = (_tail + 1) & (_queue.Length - 1);
+                _count++;
 
                 ClearPreviousOperation();
                 executeSetException = true;
@@ -336,22 +327,6 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
         }
     }
 
-    private LinkedListNode<KcpBuffer> AllocateNode(KcpBuffer buffer)
-    {
-        var node = _recycled.First;
-        if (node is null)
-        {
-            node = new LinkedListNode<KcpBuffer>(buffer);
-        }
-        else
-        {
-            node.ValueRef = buffer;
-            _recycled.Remove(node);
-        }
-
-        return node;
-    }
-
     /// <summary>
     ///     Mark the underlying transport as closed. Abort all active send or receive operations.
     ///     Note: This method signals a graceful shutdown without freeing underlying resources,
@@ -369,7 +344,13 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
                 executeSetResult = true;
             }
 
-            _recycled.Clear();
+            while (_count > 0)
+            {
+                _queue[_head].Release();
+                _queue[_head] = default;
+                _head = (_head + 1) & (_queue.Length - 1);
+                _count--;
+            }
             _transportClosed = true;
         }
 

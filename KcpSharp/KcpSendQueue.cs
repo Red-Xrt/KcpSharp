@@ -428,10 +428,25 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
         var mss = _mss;
         int originalBufferLength = buffer.Length;
-        int reservedSlots = originalBufferLength <= mss ? 1 : (originalBufferLength + mss - 1) / mss;
 
-        if (!_stream && reservedSlots > 256)
-            throw new ArgumentException("Message is too large (requires > 256 fragments).", nameof(buffer));
+        // In stream mode, the tail slot may already have free bytes; avoid reserving
+        // slots we will immediately release.  Snapshot under lock is not possible here
+        // (we haven't acquired _syncRoot yet), so we use an optimistic estimate:
+        // assume worst case (no tail space) then release excess in the finally block.
+        // For non-stream mode, every byte must occupy its own slot up to mss.
+        int reservedSlots;
+        if (_stream)
+        {
+            // Stream: 0 new slots needed if buffer fits entirely in the tail;
+            // otherwise ceil(remaining / mss).  We over-reserve by at most 1 slot.
+            reservedSlots = originalBufferLength <= mss ? 1 : (originalBufferLength + mss - 1) / mss;
+        }
+        else
+        {
+            reservedSlots = originalBufferLength <= mss ? 1 : (originalBufferLength + mss - 1) / mss;
+            if (reservedSlots > 256)
+                throw new ArgumentException("Message is too large (requires > 256 fragments).", nameof(buffer));
+        }
 
         try
         {
@@ -520,10 +535,25 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
         var mss = _mss;
         int originalBufferLength = buffer.Length;
-        int reservedSlots = originalBufferLength <= mss ? 1 : (originalBufferLength + mss - 1) / mss;
 
-        if (!_stream && reservedSlots > 256)
-            throw new ArgumentException("Message is too large (requires > 256 fragments).", nameof(buffer));
+        // In stream mode, the tail slot may already have free bytes; avoid reserving
+        // slots we will immediately release.  Snapshot under lock is not possible here
+        // (we haven't acquired _syncRoot yet), so we use an optimistic estimate:
+        // assume worst case (no tail space) then release excess in the finally block.
+        // For non-stream mode, every byte must occupy its own slot up to mss.
+        int reservedSlots;
+        if (_stream)
+        {
+            // Stream: 0 new slots needed if buffer fits entirely in the tail;
+            // otherwise ceil(remaining / mss).  We over-reserve by at most 1 slot.
+            reservedSlots = originalBufferLength <= mss ? 1 : (originalBufferLength + mss - 1) / mss;
+        }
+        else
+        {
+            reservedSlots = originalBufferLength <= mss ? 1 : (originalBufferLength + mss - 1) / mss;
+            if (reservedSlots > 256)
+                throw new ArgumentException("Message is too large (requires > 256 fragments).", nameof(buffer));
+        }
 
         try
         {

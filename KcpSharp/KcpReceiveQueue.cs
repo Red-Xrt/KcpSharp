@@ -1,145 +1,87 @@
+using System;
 using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Threading.Tasks.Sources;
 
 namespace KcpSharp;
 
-internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveResult>, IValueTaskSource<int>,
-    IValueTaskSource<bool>, IDisposable
+internal struct ReceiveQueueSlot
 {
-    private readonly System.Threading.Lock _syncRoot = new();
+    public KcpBuffer Data;
+    public byte Fragment;
+}
 
-    private readonly KcpSendReceiveQueueItemCacheUnsafe _cache;
+internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveResult>, IValueTaskSource<int>, IValueTaskSource<bool>,
+    IValueTaskSource, IDisposable
+{
+    private const byte PartiallyConsumedFragment = 255;
 
-    private readonly LinkedList<(KcpBuffer Data, byte Fragment)> _queue;
-    private readonly int _queueSize;
+    private readonly ReceiveQueueSlot[] _slots;
+    private int _head;
+    private int _tail;
+
     private readonly bool _stream;
+    private readonly System.Threading.Lock _syncRoot = new();
+    private ManualResetValueTaskSourceCore<KcpConversationReceiveResult> _mrvtsc;
+    private ManualResetValueTaskSourceCore<int> _mrvtscInt;
+    private ManualResetValueTaskSourceCore<bool> _mrvtscBool;
+    private ManualResetValueTaskSourceCore<bool> _mrvtscVoid; // Using bool underneath for Void because of standard MRVTSC
 
+    private int _completedPacketsCount;
     private int _totalBytesInQueue;
     private int _totalSegmentsInQueue;
 
     private bool _activeWait;
+    private bool _signaled;
+    private int _operationMode; // 0: receive, 1: peek, 2: wait for data, 3: receive to writer
     private Memory<byte> _buffer;
     private System.Buffers.IBufferWriter<byte>? _writer;
-    private CancellationTokenRegistration _cancellationRegistration;
-    private CancellationToken _cancellationToken;
-    private volatile int _completedPacketsCount;
-    private bool _disposed;
     private int _minimumBytes;
     private int _minimumSegments;
-    private ManualResetValueTaskSourceCore<KcpConversationReceiveResult> _mrvtsc;
-    private byte _operationMode; // 0-receive 1-wait for message 2-wait for available data 3-receive to writer
-    private bool _signaled;
+    private CancellationToken _cancellationToken;
+    private CancellationTokenRegistration _cancellationRegistration;
 
     private bool _transportClosed;
+    private bool _disposed;
 
-    private const byte PartiallyConsumedFragment = 255;
-
-    public KcpReceiveQueue(bool stream, int queueSize, KcpSendReceiveQueueItemCacheUnsafe cache)
+    public KcpReceiveQueue(bool stream, int capacity)
     {
-        _mrvtsc = new ManualResetValueTaskSourceCore<KcpConversationReceiveResult>
-        {
-            RunContinuationsAsynchronously = true
-        };
-        _queue = new LinkedList<(KcpBuffer Data, byte Fragment)>();
         _stream = stream;
-        _queueSize = queueSize;
-        _cache = cache;
+
+        int pow2Capacity = 16;
+        while (pow2Capacity <= capacity) pow2Capacity *= 2;
+        _slots = new ReceiveQueueSlot[pow2Capacity];
+
+        _mrvtsc = new ManualResetValueTaskSourceCore<KcpConversationReceiveResult>();
+        _mrvtscInt = new ManualResetValueTaskSourceCore<int>();
+        _mrvtscBool = new ManualResetValueTaskSourceCore<bool>();
+        _mrvtscVoid = new ManualResetValueTaskSourceCore<bool>();
     }
 
     public void Dispose()
     {
-        bool executeSetResult = false;
         lock (_syncRoot)
         {
             if (_disposed) return;
-            if (_activeWait && !_signaled)
-            {
-                ClearPreviousOperation(true);
-                executeSetResult = true;
-            }
-
-            var node = _queue.First;
-            while (node is not null)
-            {
-                node.ValueRef.Data.Release();
-                node = node.Next;
-            }
-
-            _queue.Clear();
-            _cache.Clear();
-            _totalBytesInQueue = 0;
-            _totalSegmentsInQueue = 0;
+            SetTransportClosed();
             _disposed = true;
-            _transportClosed = true;
         }
-
-        if (executeSetResult)
-        {
-            _mrvtsc.SetResult(default);
-        }
-    }
-
-    bool IValueTaskSource<bool>.GetResult(short token)
-    {
-        _cancellationRegistration.Dispose();
-        try
-        {
-            return !_mrvtsc.GetResult(token).TransportClosed;
-        }
-        finally
-        {
-            _mrvtsc.Reset();
-            lock (_syncRoot)
-            {
-                _activeWait = false;
-                _signaled = false;
-                _cancellationRegistration = default;
-            }
-        }
-    }
-
-    int IValueTaskSource<int>.GetResult(short token)
-    {
-        _cancellationRegistration.Dispose();
-        try
-        {
-            return _mrvtsc.GetResult(token).BytesReceived;
-        }
-        finally
-        {
-            _mrvtsc.Reset();
-            lock (_syncRoot)
-            {
-                _activeWait = false;
-                _signaled = false;
-                _cancellationRegistration = default;
-            }
-        }
-    }
-
-    public ValueTaskSourceStatus GetStatus(short token)
-    {
-        return _mrvtsc.GetStatus(token);
-    }
-
-    public void OnCompleted(Action<object?> continuation, object? state, short token,
-        ValueTaskSourceOnCompletedFlags flags)
-    {
-        _mrvtsc.OnCompleted(continuation, state, token, flags);
     }
 
     KcpConversationReceiveResult IValueTaskSource<KcpConversationReceiveResult>.GetResult(short token)
     {
         _cancellationRegistration.Dispose();
+
         try
         {
             return _mrvtsc.GetResult(token);
         }
         finally
         {
-            _mrvtsc.Reset();
             lock (_syncRoot)
             {
+                _mrvtsc.Reset();
                 _activeWait = false;
                 _signaled = false;
                 _cancellationRegistration = default;
@@ -147,7 +89,111 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         }
     }
 
-    public bool TryPeek(out KcpConversationReceiveResult result)
+    ValueTaskSourceStatus IValueTaskSource<KcpConversationReceiveResult>.GetStatus(short token)
+    {
+        return _mrvtsc.GetStatus(token);
+    }
+
+    void IValueTaskSource<KcpConversationReceiveResult>.OnCompleted(Action<object?> continuation, object? state,
+        short token, ValueTaskSourceOnCompletedFlags flags)
+    {
+        _mrvtsc.OnCompleted(continuation, state, token, flags);
+    }
+
+    int IValueTaskSource<int>.GetResult(short token)
+    {
+        _cancellationRegistration.Dispose();
+
+        try
+        {
+            return _mrvtscInt.GetResult(token);
+        }
+        finally
+        {
+            lock (_syncRoot)
+            {
+                _mrvtscInt.Reset();
+                _activeWait = false;
+                _signaled = false;
+                _cancellationRegistration = default;
+            }
+        }
+    }
+
+    ValueTaskSourceStatus IValueTaskSource<int>.GetStatus(short token)
+    {
+        return _mrvtscInt.GetStatus(token);
+    }
+
+    void IValueTaskSource<int>.OnCompleted(Action<object?> continuation, object? state, short token,
+        ValueTaskSourceOnCompletedFlags flags)
+    {
+        _mrvtscInt.OnCompleted(continuation, state, token, flags);
+    }
+
+    bool IValueTaskSource<bool>.GetResult(short token)
+    {
+        _cancellationRegistration.Dispose();
+
+        try
+        {
+            return _mrvtscBool.GetResult(token);
+        }
+        finally
+        {
+            lock (_syncRoot)
+            {
+                _mrvtscBool.Reset();
+                _activeWait = false;
+                _signaled = false;
+                _cancellationRegistration = default;
+            }
+        }
+    }
+
+    ValueTaskSourceStatus IValueTaskSource<bool>.GetStatus(short token)
+    {
+        return _mrvtscBool.GetStatus(token);
+    }
+
+    void IValueTaskSource<bool>.OnCompleted(Action<object?> continuation, object? state, short token,
+        ValueTaskSourceOnCompletedFlags flags)
+    {
+        _mrvtscBool.OnCompleted(continuation, state, token, flags);
+    }
+
+    void IValueTaskSource.GetResult(short token)
+    {
+        _cancellationRegistration.Dispose();
+
+        try
+        {
+            _mrvtscVoid.GetResult(token);
+        }
+        finally
+        {
+            lock (_syncRoot)
+            {
+                _mrvtscVoid.Reset();
+                _activeWait = false;
+                _signaled = false;
+                _cancellationRegistration = default;
+            }
+        }
+    }
+
+    ValueTaskSourceStatus IValueTaskSource.GetStatus(short token)
+    {
+        return _mrvtscVoid.GetStatus(token);
+    }
+
+    void IValueTaskSource.OnCompleted(Action<object?> continuation, object? state, short token,
+        ValueTaskSourceOnCompletedFlags flags)
+    {
+        _mrvtscVoid.OnCompleted(continuation, state, token, flags);
+    }
+
+    internal bool TryPeek(out KcpConversationReceiveResult result)
     {
         lock (_syncRoot)
         {
@@ -159,31 +205,45 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
 
             if (_activeWait) ThrowHelper.ThrowConcurrentReceiveException();
 
-            if (_completedPacketsCount == 0)
+            if ((!_stream && _completedPacketsCount > 0) || (_stream && _totalBytesInQueue > 0))
             {
-                result = new KcpConversationReceiveResult(0);
-                return false;
+                if (CalculatePacketSize(out var bytesRecevied))
+                {
+                    result = new KcpConversationReceiveResult(bytesRecevied);
+                    return true;
+                }
             }
 
-            var node = _queue.First;
-            if (node is null)
-            {
-                result = new KcpConversationReceiveResult(0);
-                return false;
-            }
-
-            if (CalculatePacketSize(node, out var packetSize))
-            {
-                result = new KcpConversationReceiveResult(packetSize);
-                return true;
-            }
-
-            result = default;
+            result = new KcpConversationReceiveResult(0);
             return false;
         }
     }
 
-    public ValueTask<KcpConversationReceiveResult> WaitToReceiveAsync(CancellationToken cancellationToken)
+    internal bool TryReceive(Span<byte> buffer, out KcpConversationReceiveResult result)
+    {
+        lock (_syncRoot)
+        {
+            if (_disposed || _transportClosed)
+            {
+                result = default;
+                return false;
+            }
+
+            if (_activeWait) ThrowHelper.ThrowConcurrentReceiveException();
+
+            if ((!_stream && _completedPacketsCount > 0) || (_stream && _totalBytesInQueue > 0))
+            {
+                ConsumePacket(buffer, out result, out var bufferTooSmall);
+                if (bufferTooSmall) ThrowHelper.ThrowBufferTooSmall();
+                return true;
+            }
+
+            result = new KcpConversationReceiveResult(0);
+            return false;
+        }
+    }
+
+    internal ValueTask<KcpConversationReceiveResult> WaitToReceiveAsync(CancellationToken cancellationToken)
     {
         short token;
         lock (_syncRoot)
@@ -196,30 +256,18 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
                 return new ValueTask<KcpConversationReceiveResult>(
                     Task.FromCanceled<KcpConversationReceiveResult>(cancellationToken));
 
-            _operationMode = 1;
-            _buffer = default;
-            _minimumBytes = 0;
-            _minimumSegments = 0;
-
-            if (_completedPacketsCount > 0)
+            if ((!_stream && _completedPacketsCount > 0) || (_stream && _totalBytesInQueue > 0))
             {
-                ConsumePacket(_buffer.Span, out var result, out var bufferTooSmall);
-                ClearPreviousOperation(false);
-                if (bufferTooSmall)
-                {
-                    Debug.Assert(false, "This should never be reached.");
-                    return new ValueTask<KcpConversationReceiveResult>(
-                        Task.FromException<KcpConversationReceiveResult>(
-                            ThrowHelper.NewBufferTooSmallForBufferArgument()));
-                }
-
-                return new ValueTask<KcpConversationReceiveResult>(result);
+                if (CalculatePacketSize(out var bytesRecevied))
+                    return new ValueTask<KcpConversationReceiveResult>(new KcpConversationReceiveResult(bytesRecevied));
             }
 
-            token = _mrvtsc.Version;
             _activeWait = true;
             Debug.Assert(!_signaled);
+            _operationMode = 1;
             _cancellationToken = cancellationToken;
+
+            token = _mrvtsc.Version;
         }
 
         _cancellationRegistration =
@@ -228,20 +276,16 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         return new ValueTask<KcpConversationReceiveResult>(this, token);
     }
 
-    public ValueTask<bool> WaitForAvailableDataAsync(int minimumBytes, int minimumSegments,
+    internal ValueTask<bool> WaitForAvailableDataAsync(int minimumBytes, int minimumSegments,
         CancellationToken cancellationToken)
     {
-        if (minimumBytes < 0)
-            return new ValueTask<bool>(
-                Task.FromException<bool>(ThrowHelper.NewArgumentOutOfRangeException(nameof(minimumBytes))));
-        if (minimumSegments < 0)
-            return new ValueTask<bool>(
-                Task.FromException<bool>(ThrowHelper.NewArgumentOutOfRangeException(nameof(minimumSegments))));
+        if (minimumBytes < 0) ThrowHelper.ThrowArgumentOutOfRangeException(nameof(minimumBytes));
+        if (minimumSegments < 0) ThrowHelper.ThrowArgumentOutOfRangeException(nameof(minimumSegments));
 
         short token;
         lock (_syncRoot)
         {
-            if (_transportClosed || _disposed) return default;
+            if (_transportClosed || _disposed) return new ValueTask<bool>(false);
             if (_activeWait)
                 return new ValueTask<bool>(Task.FromException<bool>(ThrowHelper.NewConcurrentReceiveException()));
             if (cancellationToken.IsCancellationRequested)
@@ -252,12 +296,11 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
             _activeWait = true;
             Debug.Assert(!_signaled);
             _operationMode = 2;
-            _buffer = default;
             _minimumBytes = minimumBytes;
             _minimumSegments = minimumSegments;
             _cancellationToken = cancellationToken;
 
-            token = _mrvtsc.Version;
+            token = _mrvtscBool.Version;
         }
 
         _cancellationRegistration =
@@ -266,43 +309,9 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         return new ValueTask<bool>(this, token);
     }
 
-    public bool TryReceive(Span<byte> buffer, out KcpConversationReceiveResult result)
+    internal ValueTask<KcpConversationReceiveResult> ReceiveAsync(Memory<byte> buffer,
+        CancellationToken cancellationToken = default)
     {
-        if (buffer.Length == 0)
-        {
-            throw new ArgumentException("Buffer must have non-zero length in receive operations.", nameof(buffer));
-        }
-        lock (_syncRoot)
-        {
-            if (_disposed || _transportClosed)
-            {
-                result = default;
-                return false;
-            }
-
-            if (_activeWait) ThrowHelper.ThrowConcurrentReceiveException();
-
-            if (_completedPacketsCount == 0)
-            {
-                result = new KcpConversationReceiveResult(0);
-                return false;
-            }
-
-            Debug.Assert(!_signaled);
-            _operationMode = 0;
-
-            ConsumePacket(buffer, out result, out var bufferTooSmall);
-            ClearPreviousOperation(false);
-            if (bufferTooSmall) ThrowHelper.ThrowBufferTooSmall();
-            return true;
-        }
-    }
-
-    public ValueTask<KcpConversationReceiveResult> ReceiveAsync(Memory<byte> buffer,
-        CancellationToken cancellationToken)
-    {
-        if (buffer.Length == 0)
-            return new ValueTask<KcpConversationReceiveResult>(Task.FromException<KcpConversationReceiveResult>(ThrowHelper.NewArgumentException_BufferMustHaveNonZeroLength()));
         short token;
         lock (_syncRoot)
         {
@@ -314,13 +323,9 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
                 return new ValueTask<KcpConversationReceiveResult>(
                     Task.FromCanceled<KcpConversationReceiveResult>(cancellationToken));
 
-            _operationMode = 0;
-            _buffer = buffer;
-
-            if (_completedPacketsCount > 0)
+            if ((!_stream && _completedPacketsCount > 0) || (_stream && _totalBytesInQueue > 0))
             {
-                ConsumePacket(_buffer.Span, out var result, out var bufferTooSmall);
-                ClearPreviousOperation(false);
+                ConsumePacket(buffer.Span, out var result, out var bufferTooSmall);
                 if (bufferTooSmall)
                     return new ValueTask<KcpConversationReceiveResult>(
                         Task.FromException<KcpConversationReceiveResult>(
@@ -328,10 +333,13 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
                 return new ValueTask<KcpConversationReceiveResult>(result);
             }
 
-            token = _mrvtsc.Version;
             _activeWait = true;
             Debug.Assert(!_signaled);
+            _operationMode = 0;
+            _buffer = buffer;
             _cancellationToken = cancellationToken;
+
+            token = _mrvtsc.Version;
         }
 
         _cancellationRegistration =
@@ -340,38 +348,33 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         return new ValueTask<KcpConversationReceiveResult>(this, token);
     }
 
-    public ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
+    internal ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken)
     {
-        if (buffer.Length == 0)
-            return new ValueTask<int>(0);
-
         short token;
         lock (_syncRoot)
         {
-            if (_transportClosed || _disposed)
-                return new ValueTask<int>(0);
+            if (_transportClosed || _disposed) return default;
             if (_activeWait)
                 return new ValueTask<int>(Task.FromException<int>(ThrowHelper.NewConcurrentReceiveException()));
             if (cancellationToken.IsCancellationRequested)
                 return new ValueTask<int>(Task.FromCanceled<int>(cancellationToken));
 
-            _operationMode = 0;
-            _buffer = buffer;
-
-            if (_completedPacketsCount > 0)
+            if ((!_stream && _completedPacketsCount > 0) || (_stream && _totalBytesInQueue > 0))
             {
-                ConsumePacket(_buffer.Span, out var result, out var bufferTooSmall);
-                ClearPreviousOperation(false);
+                ConsumePacket(buffer.Span, out var result, out var bufferTooSmall);
                 if (bufferTooSmall)
                     return new ValueTask<int>(
                         Task.FromException<int>(ThrowHelper.NewBufferTooSmallForBufferArgument()));
                 return new ValueTask<int>(result.BytesReceived);
             }
 
-            token = _mrvtsc.Version;
             _activeWait = true;
             Debug.Assert(!_signaled);
+            _operationMode = 4; // ReadAsync mode
+            _buffer = buffer;
             _cancellationToken = cancellationToken;
+
+            token = _mrvtscInt.Version;
         }
 
         _cancellationRegistration =
@@ -380,7 +383,8 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         return new ValueTask<int>(this, token);
     }
 
-    public ValueTask<KcpConversationReceiveResult> ReceiveToWriterAsync(System.Buffers.IBufferWriter<byte> writer, CancellationToken cancellationToken)
+    internal ValueTask<KcpConversationReceiveResult> ReceiveToWriterAsync(System.Buffers.IBufferWriter<byte> writer,
+        CancellationToken cancellationToken = default)
     {
         short token;
         lock (_syncRoot)
@@ -393,20 +397,19 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
                 return new ValueTask<KcpConversationReceiveResult>(
                     Task.FromCanceled<KcpConversationReceiveResult>(cancellationToken));
 
-            _operationMode = 3; // 3-receive to writer
-            _writer = writer;
-
-            if (_completedPacketsCount > 0)
+            if ((!_stream && _completedPacketsCount > 0) || (_stream && _totalBytesInQueue > 0))
             {
                 ConsumePacketToWriter(writer, out var result);
-                ClearPreviousOperation(false);
                 return new ValueTask<KcpConversationReceiveResult>(result);
             }
 
-            token = _mrvtsc.Version;
             _activeWait = true;
             Debug.Assert(!_signaled);
+            _operationMode = 3;
+            _writer = writer;
             _cancellationToken = cancellationToken;
+
+            token = _mrvtsc.Version;
         }
 
         _cancellationRegistration =
@@ -415,7 +418,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         return new ValueTask<KcpConversationReceiveResult>(this, token);
     }
 
-    public bool CancelPendingOperation(Exception? innerException, CancellationToken cancellationToken)
+    internal bool CancelPendingOperation(Exception? innerException, CancellationToken cancellationToken)
     {
         bool executeSetException = false;
         Exception? exceptionToSet = null;
@@ -431,7 +434,12 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
 
         if (executeSetException)
         {
-            _mrvtsc.SetException(exceptionToSet!);
+            if (_operationMode == 0 || _operationMode == 1 || _operationMode == 3)
+                _mrvtsc.SetException(exceptionToSet!);
+            else if (_operationMode == 2)
+                _mrvtscBool.SetException(exceptionToSet!);
+            else if (_operationMode == 4)
+                _mrvtscInt.SetException(exceptionToSet!);
             return true;
         }
 
@@ -442,11 +450,13 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
     {
         bool executeSetException = false;
         Exception? exceptionToSet = null;
+        int operationMode = 0;
         lock (_syncRoot)
         {
             if (_activeWait && !_signaled)
             {
                 var cancellationToken = _cancellationToken;
+                operationMode = _operationMode;
                 ClearPreviousOperation(true);
                 exceptionToSet = new OperationCanceledException(cancellationToken);
                 executeSetException = true;
@@ -455,152 +465,83 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
 
         if (executeSetException)
         {
-            _mrvtsc.SetException(exceptionToSet!);
+            if (operationMode == 0 || operationMode == 1 || operationMode == 3)
+                _mrvtsc.SetException(exceptionToSet!);
+            else if (operationMode == 2)
+                _mrvtscBool.SetException(exceptionToSet!);
+            else if (operationMode == 4)
+                _mrvtscInt.SetException(exceptionToSet!);
         }
     }
 
     private void ClearPreviousOperation(bool signaled)
     {
         _signaled = signaled;
-        _operationMode = 0;
         _buffer = default;
         _writer = null;
-        _minimumBytes = default;
-        _minimumSegments = default;
         _cancellationToken = default;
     }
 
-    public void Enqueue(KcpBuffer buffer, byte fragment)
+    internal void Enqueue(in KcpBuffer buffer, byte fragment)
     {
         bool executeSetException = false;
         Exception? exceptionToSet = null;
         bool executeSetResult = false;
         KcpConversationReceiveResult resultToSet = default;
-
         lock (_syncRoot)
         {
-            if (_transportClosed || _disposed)
+            if (_transportClosed || _disposed) return;
+
+            int count = (_tail - _head) & (_slots.Length - 1);
+            if (_tail < _head) count = _slots.Length - _head + _tail; // Real count logic because bitwise ring buffer could be 0 when head == tail but full when head == tail. Wait, standard head/tail logic with empty slot is length-1 max capacity.
+            // But if we enforce max size as Length - 1:
+            int nextTail = (_tail + 1) & (_slots.Length - 1);
+            if (nextTail == _head)
             {
+                // Queue full
+                KcpMetrics.PacketsDropped.Add(1);
                 buffer.Release();
                 return;
             }
 
-            bool appended = false;
-            if (_stream)
-            {
-                if (buffer.Length == 0) {
-                    buffer.Release();
-                    return; 
-                }
-                fragment = 0;
+            _slots[_tail].Data = buffer;
+            _slots[_tail].Fragment = fragment;
+            _tail = nextTail;
 
-                var lastNode = _queue.Last;
-                if (lastNode is not null && lastNode.ValueRef.Data.TryAppend(ref buffer, out var combined))
-                {
-                    // appended
-                    if (lastNode.ValueRef.Fragment != 0)
-                    {
-                        if (lastNode.ValueRef.Fragment != PartiallyConsumedFragment)
-                        {
-                            Interlocked.Increment(ref _completedPacketsCount);
-                        }
-                        lastNode.ValueRef.Fragment = 0;
-                    }
-                    lastNode.ValueRef.Data = combined;
-                    _totalBytesInQueue += buffer.Length;
-                    buffer.Release();
-                    appended = true;
-                }
-                else
-                {
-                    // Basic duplicate mitigation for stream mode: if the node already exists or we desync
-                    // Here we just add it, duplicate check inside KcpReceiveQueue is hard because we don't track SN.
-                    // Instead, we just trust the caller (KcpConversation) already dedups.
-                    // To add duplicate tracking in stream mode inside KcpReceiveQueue, we would need to track SN or byte offsets.
-                    // The instruction said: "Thêm counter theo dõi dedup failures."
-                    // Since HandleData handles SN, duplicate packets might reach here if desynced.
-                    // Adding simple check or metric. Actually HandleData is the only caller.
-                    _queue.AddLast(_cache.Rent(buffer, 0));
-                    _totalBytesInQueue += buffer.Length;
-                    _totalSegmentsInQueue++;
-                }
-            }
-            else
-            {
-                var lastNode = _queue.Last;
-                if (lastNode is null || lastNode.ValueRef.Fragment == 0 || (byte)(lastNode.ValueRef.Fragment - 1) == fragment)
-                {
-                    _queue.AddLast(_cache.Rent(buffer, fragment));
-                    _totalBytesInQueue += buffer.Length;
-                    if (fragment == 0) _totalSegmentsInQueue++;
-                }
-                else
-                {
-                    KcpMetrics.PacketsDropped.Add(1);
-                    buffer.Release();
-                    return; // Dropped invalid fragment sequence silently
-                }
-            }
+            _totalBytesInQueue += buffer.Length;
+            if (fragment == 0 || _stream)
+                _totalSegmentsInQueue++;
 
-            if (fragment == 0 && !appended)
+            if (fragment == 0)
             {
                 _completedPacketsCount++;
-                if (_activeWait && !_signaled)
+            }
+
+            if (_activeWait && !_signaled)
+            {
+                if ((!_stream && _completedPacketsCount > 0) || (_stream && _totalBytesInQueue > 0))
                 {
                     TryCompleteReceive(ref executeSetException, ref exceptionToSet, ref executeSetResult, ref resultToSet);
-                    TryCompleteWaitForData(ref executeSetResult, ref resultToSet);
                 }
+                TryCompleteWaitForData(ref executeSetResult, ref resultToSet);
             }
-            else if (appended)
-            {
-                if (_activeWait && !_signaled)
-                {
-                    TryCompleteReceiveAppended(ref executeSetException, ref exceptionToSet, ref executeSetResult, ref resultToSet);
-                    TryCompleteWaitForData(ref executeSetResult, ref resultToSet);
-                }
-            }
-        } // lock ends here
+        }
 
         if (executeSetException)
         {
-            _mrvtsc.SetException(exceptionToSet!);
+            if (_operationMode == 0 || _operationMode == 1 || _operationMode == 3)
+                _mrvtsc.SetException(exceptionToSet!);
+            else if (_operationMode == 4)
+                _mrvtscInt.SetException(exceptionToSet!);
         }
         else if (executeSetResult)
         {
-            _mrvtsc.SetResult(resultToSet);
-        }
-    }
-
-    private void TryCompleteReceiveAppended(ref bool executeSetException, ref Exception? exceptionToSet, ref bool executeSetResult, ref KcpConversationReceiveResult resultToSet)
-    {
-        // FIX: wake reader for all read modes when data exists
-        if (_operationMode == 0 || _operationMode == 3)
-        {
-            if (_queue.First is not null && _totalBytesInQueue > 0)
-            {
-                if (_operationMode == 3)
-                {
-                    ConsumePacketToWriter(_writer!, out var r2);
-                    ClearPreviousOperation(true);
-                    resultToSet = r2;
-                    executeSetResult = true;
-                }
-                else
-                {
-                    ConsumePacket(_buffer.Span, out var r2, out var bufferTooSmall);
-                    ClearPreviousOperation(true);
-                    if (bufferTooSmall)
-                    {
-                        exceptionToSet = ThrowHelper.NewBufferTooSmallForBufferArgument();
-                        executeSetException = true;
-                    }
-                    else
-                    {
-                        resultToSet = r2;
-                        executeSetResult = true;
-                    }
-                }
-            }
+            if (_operationMode == 0 || _operationMode == 1 || _operationMode == 3)
+                _mrvtsc.SetResult(resultToSet);
+            else if (_operationMode == 2)
+                _mrvtscBool.SetResult(true);
+            else if (_operationMode == 4)
+                _mrvtscInt.SetResult(resultToSet.BytesReceived);
         }
     }
 
@@ -608,9 +549,9 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
     {
         Debug.Assert(_activeWait && !_signaled);
 
-        if (_operationMode <= 1)
+        if (_operationMode <= 1 || _operationMode == 4)
         {
-            Debug.Assert(_operationMode == 0 || _operationMode == 1);
+            Debug.Assert(_operationMode == 0 || _operationMode == 1 || _operationMode == 4);
             ConsumePacket(_buffer.Span, out var result, out var bufferTooSmall);
             ClearPreviousOperation(true);
             if (bufferTooSmall)
@@ -647,23 +588,18 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
 
     private void ConsumePacketToWriter(System.Buffers.IBufferWriter<byte> writer, out KcpConversationReceiveResult result)
     {
-        var node = _queue.First;
-        if (node is null)
+        if (_head == _tail)
         {
             result = default;
             return;
         }
 
         var bytesInPacket = 0;
-        node = _queue.First;
-        LinkedListNode<(KcpBuffer Data, byte Fragment)>? next;
 
-        while (node is not null)
+        while (_head != _tail)
         {
-            next = node.Next;
-
-            var fragment = node.ValueRef.Fragment;
-            ref var data = ref node.ValueRef.Data;
+            var fragment = _slots[_head].Fragment;
+            ref var data = ref _slots[_head].Data;
 
             if (data.Length > 0)
             {
@@ -677,13 +613,13 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
             _totalBytesInQueue -= data.Length;
             if (fragment == 0 || _stream) _totalSegmentsInQueue--;
             data.Release();
-            _queue.Remove(node);
-            _cache.Return(node);
+
+            _slots[_head] = default; // clear
+            _head = (_head + 1) & (_slots.Length - 1);
+
             if (fragment == 0 || fragment == PartiallyConsumedFragment) _completedPacketsCount--;
 
             if (!_stream && fragment == 0) break;
-
-            node = next;
         }
 
         result = new KcpConversationReceiveResult(bytesInPacket);
@@ -691,8 +627,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
 
     private void ConsumePacket(Span<byte> buffer, out KcpConversationReceiveResult result, out bool bufferTooSmall)
     {
-        var node = _queue.First;
-        if (node is null)
+        if (_head == _tail)
         {
             result = default;
             bufferTooSmall = false;
@@ -702,7 +637,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         // peek
         if (_operationMode == 1)
         {
-            if (CalculatePacketSize(node, out var bytesRecevied))
+            if (CalculatePacketSize(out var bytesRecevied))
                 result = new KcpConversationReceiveResult(bytesRecevied);
             else
                 result = default;
@@ -716,14 +651,15 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         var bytesInPacket = 0;
         if (!_stream)
         {
-            while (node is not null)
+            int current = _head;
+            while (current != _tail)
             {
-                bytesInPacket += node.ValueRef.Data.Length;
-                if (node.ValueRef.Fragment == 0) break;
-                node = node.Next;
+                bytesInPacket += _slots[current].Data.Length;
+                if (_slots[current].Fragment == 0) break;
+                current = (current + 1) & (_slots.Length - 1);
             }
 
-            if (node is null)
+            if (current == _tail)
             {
                 // incomplete packet
                 result = default;
@@ -741,15 +677,12 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
 
         var anyDataReceived = false;
         bytesInPacket = 0;
-        node = _queue.First;
-        LinkedListNode<(KcpBuffer Data, byte Fragment)>? next;
-        while (node is not null)
-        {
-            next = node.Next;
 
-            var fragment = node.ValueRef.Fragment;
+        while (_head != _tail)
+        {
+            var fragment = _slots[_head].Fragment;
             var originalFragment = fragment; // Cache original fragment to prevent breaking message boundary after marking as 255
-            ref var data = ref node.ValueRef.Data;
+            ref var data = ref _slots[_head].Data;
 
             var sizeToCopy = Math.Min(data.Length, buffer.Length);
             data.DataRegion.Span.Slice(0, sizeToCopy).CopyTo(buffer);
@@ -760,7 +693,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
             if (sizeToCopy != data.Length)
             {
                 // partial data is received.
-                node.ValueRef = (data.Consume(sizeToCopy), node.ValueRef.Fragment);
+                _slots[_head].Data = data.Consume(sizeToCopy);
                 _totalBytesInQueue -= sizeToCopy;
 
                 // Even though the data is only partially consumed, if this is the last fragment of a packet
@@ -769,7 +702,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
                 if (fragment == 0 && sizeToCopy > 0)
                 {
                     // By setting the fragment to a non-zero value, we prevent it from being counted again later.
-                    node.ValueRef = (node.ValueRef.Data, PartiallyConsumedFragment);
+                    _slots[_head].Fragment = PartiallyConsumedFragment;
                     // Do not decrement in stream mode, because the partial read means more data is still available
                     // and we shouldn't zero out completedPacketsCount and prevent future reads of the remaining chunk.
                     if (!_stream)
@@ -784,16 +717,16 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
                 _totalBytesInQueue -= data.Length;
                 if (fragment == 0 || _stream) _totalSegmentsInQueue--;
                 data.Release();
-                _queue.Remove(node);
-                _cache.Return(node);
+
+                _slots[_head] = default;
+                _head = (_head + 1) & (_slots.Length - 1);
+
                 if (fragment == 0 || fragment == PartiallyConsumedFragment) _completedPacketsCount--;
             }
 
             if (!_stream && originalFragment == 0) break;
 
             if (sizeToCopy == 0) break;
-
-            node = next;
         }
 
         if (!anyDataReceived)
@@ -808,26 +741,33 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         }
     }
 
-    private static bool CalculatePacketSize(LinkedListNode<(KcpBuffer Data, byte Fragment)> first, out int packetSize)
+    private bool CalculatePacketSize(out int packetSize)
     {
-        var bytesRecevied = first.ValueRef.Data.Length;
-        if (first.ValueRef.Fragment == 0)
+        int current = _head;
+        if (current == _tail)
+        {
+            packetSize = 0;
+            return false;
+        }
+
+        var bytesRecevied = _slots[current].Data.Length;
+        if (_slots[current].Fragment == 0)
         {
             packetSize = bytesRecevied;
             return true;
         }
 
-        var node = first.Next;
-        while (node is not null)
+        current = (current + 1) & (_slots.Length - 1);
+        while (current != _tail)
         {
-            bytesRecevied += node.ValueRef.Data.Length;
-            if (node.ValueRef.Fragment == 0)
+            bytesRecevied += _slots[current].Data.Length;
+            if (_slots[current].Fragment == 0)
             {
                 packetSize = bytesRecevied;
                 return true;
             }
 
-            node = node.Next;
+            current = (current + 1) & (_slots.Length - 1);
         }
 
         // deadlink
@@ -857,23 +797,28 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
                 executeSetResult = true;
             }
 
-            var node = _queue.First;
-            while (node is not null)
+            while (_head != _tail)
             {
-                node.ValueRef.Data.Release();
-                node = node.Next;
+                _slots[_head].Data.Release();
+                _slots[_head] = default;
+                _head = (_head + 1) & (_slots.Length - 1);
             }
-            _queue.Clear();
-            _cache.Clear();
+            _head = _tail = 0;
             _totalBytesInQueue = 0;
             _totalSegmentsInQueue = 0;
+            _completedPacketsCount = 0;
 
             _transportClosed = true;
         }
 
         if (executeSetResult)
         {
-            _mrvtsc.SetResult(default);
+            if (_operationMode == 0 || _operationMode == 1 || _operationMode == 3)
+                _mrvtsc.SetResult(default);
+            else if (_operationMode == 2)
+                _mrvtscBool.SetResult(false);
+            else if (_operationMode == 4)
+                _mrvtscInt.SetResult(0);
         }
     }
 
