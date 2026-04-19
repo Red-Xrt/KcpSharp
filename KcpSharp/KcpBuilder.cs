@@ -65,6 +65,11 @@ public sealed class KcpBuilder
         return this;
     }
 
+    /// <summary>
+    ///     Creates a UDP socket for the conversation.
+    ///     If the socket is not bound manually and <see cref="WithLocalEndPoint"/> is not used,
+    ///     <see cref="Build"/> will automatically bind the socket to the ephemeral endpoint 0.0.0.0:0.
+    /// </summary>
     public KcpBuilder WithUdpSocket(AddressFamily addressFamily, out Socket socket)
     {
         socket = new Socket(addressFamily, SocketType.Dgram, ProtocolType.Udp);

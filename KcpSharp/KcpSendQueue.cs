@@ -186,7 +186,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             return 0;
 
         int count = 0;
-        bool needSignal = false;
+        bool executeSetResult = false;
         lock (_syncRoot)
         {
             while (_queueCount > 0 && count < maxCount && count < results.Length)
@@ -201,7 +201,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
             if (count > 0)
             {
-                CheckForAvailableSpace(ref needSignal);
+                CheckForAvailableSpace(ref executeSetResult);
             }
         }
 
@@ -217,7 +217,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             }
         }
 
-        if (needSignal)
+        if (executeSetResult)
             _mrvtsc.SetResult(true);
 
         return count;

@@ -39,6 +39,14 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
 
     public bool HasPendingPackets => _ringBuffer.HasItems;
 
+    public bool HasTimerPending()
+    {
+        lock (SyncRoot)
+        {
+            return _notificationPending;
+        }
+    }
+
     public void Dispose()
     {
         KcpGlobalTickEngine.Unregister(this);
@@ -231,12 +239,15 @@ internal sealed class KcpReceiveRingBuffer : IDisposable
         _mask = capacity - 1;
     }
 
+    private bool _disposed;
+
     public bool TryEnqueue(ReadOnlyMemory<byte> packet, System.Buffers.IMemoryOwner<byte>? owner)
     {
         bool lockTaken = false;
         try
         {
             _spinLock.Enter(ref lockTaken);
+            if (_disposed) return false;
             if (_tail - _head >= _slots.Length) return false;
 
             _slots[_tail & _mask] = new Slot(packet, owner);
@@ -281,16 +292,26 @@ internal sealed class KcpReceiveRingBuffer : IDisposable
 
     public void Dispose()
     {
-        int head = Volatile.Read(ref _head);
-        int tail = Volatile.Read(ref _tail);
-
-        while (head != tail)
+        bool lockTaken = false;
+        try
         {
-            var slot = _slots[head & _mask];
-            slot.Owner?.Dispose();
-            _slots[head & _mask] = default;
-            head++;
+            _spinLock.Enter(ref lockTaken);
+            _disposed = true;
+            int head = _head;
+            int tail = _tail;
+
+            while (head != tail)
+            {
+                var slot = _slots[head & _mask];
+                slot.Owner?.Dispose();
+                _slots[head & _mask] = default;
+                head++;
+            }
+            _head = tail;
         }
-        Volatile.Write(ref _head, tail);
+        finally
+        {
+            if (lockTaken) _spinLock.Exit(false);
+        }
     }
 }

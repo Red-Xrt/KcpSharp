@@ -70,6 +70,8 @@ internal sealed class KcpSocketTransportForConversation : KcpSocketTransport<Kcp
         if (_conversationId.HasValue && _rawPacketHandler is not null && packet.Length >= 4)
         {
             var convId = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(packet.Span);
+            // Note: If the conversation ID is non-zero, packets prefixed with 0 are routed
+            // as raw packets. If the conversation ID is 0, this logic does not apply.
             if (convId == 0 && _conversationId.Value != 0) // Treat 0 as raw only if conv is not 0
             {
                 var handled = _rawPacketHandler.Invoke(packet.Slice(4), remoteEndPoint);

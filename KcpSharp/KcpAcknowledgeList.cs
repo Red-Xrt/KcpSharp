@@ -135,6 +135,7 @@ internal sealed class KcpAcknowledgeList
             if (currentEnqueuePos - currentDequeuePos >= _maxCapacity)
             {
                 // Drop packet if full
+                KcpMetrics.AckDropped.Add(1);
                 return;
             }
 

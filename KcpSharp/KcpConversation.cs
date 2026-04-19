@@ -45,8 +45,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private uint _rmt_wnd;
     private uint _cwnd;
     /// <remarks>
-    /// THREADING: Only accessed from RunUpdateOnActivationCore's single-threaded loop.
-    /// Do NOT access from multiple threads without synchronization.
+    /// THREADING: Updated concurrently from receive threads via Interlocked.Or, and cleared in flush loop.
+    /// Access safely across threads.
     /// </remarks>
     private volatile int _probe;
 
@@ -199,6 +199,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         _fastlimit = 5;
         _nocwnd = options is not null && options.DisableCongestionControl;
         StreamMode = options is not null && options.StreamMode;
+
+        // Note: The dequeue buffer size is intentionally capped at 256. If _snd_wnd is configured > 256,
+        // each flush cycle will dequeue and encode a maximum of 256 segments per iteration.
+        // This is safe because KCP fragmentation only supports 256 fragments, but large windows may see chunked throughput.
         _flushDequeueBuffer = new (KcpBuffer, byte)[Math.Min((int)_snd_wnd, 256)];
 
         int sndBufCapacity = 16;
@@ -268,21 +272,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         _cachedFlushBuffer = _bufferPool.Rent(new KcpBufferPoolRentOptions(_mtu, true));
         _cachedAckFlushBuffer = _bufferPool.Rent(new KcpBufferPoolRentOptions(_mtu, true));
 
-        try
-        {
-            RunUpdateOnActivation();
-        }
-        catch
-        {
-            _updateActivation?.Dispose();
-            _cachedFlushBuffer.Dispose();
-            _cachedAckFlushBuffer.Dispose();
-            _updateLoopCts?.Dispose();
-            _sendQueue?.Dispose();
-            _receiveQueue?.Dispose();
-            _flushSemaphore?.Dispose();
-            throw;
-        }
+        RunUpdateOnActivation();
     }
 
     /// <summary>
@@ -707,13 +697,18 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
                         // Re-verify inside lock before popping to avoid data loss
                         int actualAvailable = TimeDiff(_snd_una + cwnd, _snd_nxt);
-                        int toProcess = Math.Min(batchSize, actualAvailable);
+                        int toProcess = Math.Min(batchSize, Math.Max(0, actualAvailable));
 
                         if (toProcess <= 0)
                         {
                             break;
                         }
 
+                        // We MUST dequeue strictly the exact number of elements we are about to put
+                        // into the `_sndBufArray` to avoid dropping successfully dequeued items.
+                        // Holding the lock here guarantees no concurrent changes to the bounds
+                        // and no lost packets. The lock convoy issue must be solved via queue
+                        // re-architecture in the future if this performance hit is unacceptable.
                         dequeuedCount = _sendQueue.TryDequeueBatch(dequeueBufferArray.AsSpan(0, toProcess), toProcess);
                         if (dequeuedCount == 0)
                         {
@@ -748,14 +743,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 }
                 finally
                 {
-                    // Prevent leaking the remaining un-processed elements in this batch chunk
-                    if (processedCount < dequeuedCount)
-                    {
-                        for (int j = processedCount; j < dequeuedCount; j++)
-                        {
-                            dequeueBufferArray[j].Item1.Release();
-                        }
-                    }
 
                     // Clear references so memory can be GC'd when done
                     Array.Clear(dequeueBufferArray, 0, dequeuedCount);
@@ -940,7 +927,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         {
                             buffer.Span.Slice(size, postBufferSize).Clear();
                         }
-                        if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false)) return;
+                        if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false))
+                        {
+                            size = preBufferSize; // Reset before returning
+                            return;
+                        }
                         size = preBufferSize;
                         if (preBufferSize > 0)
                         {
@@ -956,6 +947,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         {
                             await Task.Yield();
                             flushStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
+                            current = GetTimestamp();
                         }
                     }
                 }
@@ -1135,7 +1127,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                     {
                         buffer.Span.Slice(size, postBufferSize).Clear();
                     }
-                    if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false)) return;
+                    if (!await TrySendOrBatchAsync(buffer, size, postBufferSize, batch, cancellationToken).ConfigureAwait(false))
+                    {
+                        size = preBufferSize; // Reset before returning
+                        return;
+                    }
                     if (batch is not null)
                         await batch.FlushBatchAsync(cancellationToken).ConfigureAwait(false);
                     size = preBufferSize;
@@ -1273,7 +1269,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                     anyUpdate |= notification.TimerNotification;
                 }
 
-                if (!activation.HasPendingPackets) break;
+                if (!activation.HasPendingPackets)
+                {
+                    // If we finished draining packets, check if a timer notification arrived in the meantime
+                    if (activation.HasTimerPending()) continue;
+                    break;
+                }
 
                 // Yield if we have exhausted our time budget draining pending packets
                 if (System.Diagnostics.Stopwatch.GetTimestamp() - drainStartTicks >= drainBudgetTicks)
@@ -2205,7 +2206,13 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         _ackList.Clear();
     }
 
-    /// <inheritdoc />
+    /// <summary>
+    ///     Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
+    ///     <para>
+    ///     Warning: Background buffer teardown is asynchronous and not guaranteed to be complete upon return.
+    ///     In tests or fast-restart scenarios where flush buffers might be reused immediately, use <see cref="DisposeAsync"/> instead.
+    ///     </para>
+    /// </summary>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
@@ -2216,6 +2223,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         // Start background tear down for the main tasks to avoid blocking synchronous Dispose.
         // Waiting synchronously in Dispose causes thread-pool starvation.
+        // Warning: this is fire-and-forget; potential use-after-free can occur if pre-allocated buffers are reused immediately.
         _ = DisposeBackgroundTasksAsync();
     }
 
