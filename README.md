@@ -75,7 +75,8 @@ public class PureKcpExample
                 try
                 {
                     var result = await udpSocket.ReceiveFromAsync(udpBuffer, SocketFlags.None, remoteEndPoint);
-                    await conversation.InputPacketAsync(udpBuffer.AsMemory(0, result.ReceivedBytes));
+                    var sink = (IKcpPacketSink)conversation;
+                    await sink.InputPacketAsync(udpBuffer.AsMemory(0, result.ReceivedBytes), (IPEndPoint)result.RemoteEndPoint, null, default);
                 }
                 catch (Exception) { break; }
             }

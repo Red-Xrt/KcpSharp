@@ -15,6 +15,11 @@ internal struct ReceiveQueueSlot
 internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveResult>, IValueTaskSource<int>, IValueTaskSource<bool>,
     IValueTaskSource, IDisposable
 {
+    /// <summary>
+    ///     A marker used in StreamMode to indicate that a fragment was only partially consumed
+    ///     into the caller's buffer. In Non-Stream (Datagram) Mode, it is mathematically
+    ///     unreachable because datagram consumes ensure sufficient buffer size prior to copy.
+    /// </summary>
     private const byte PartiallyConsumedFragment = 255;
 
     private readonly ReceiveQueueSlot[] _slots;
@@ -492,9 +497,6 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         {
             if (_transportClosed || _disposed) return;
 
-            int count = (_tail - _head) & (_slots.Length - 1);
-            if (_tail < _head) count = _slots.Length - _head + _tail; // Real count logic because bitwise ring buffer could be 0 when head == tail but full when head == tail. Wait, standard head/tail logic with empty slot is length-1 max capacity.
-            // But if we enforce max size as Length - 1:
             int nextTail = (_tail + 1) & (_slots.Length - 1);
             if (nextTail == _head)
             {
@@ -822,6 +824,11 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         }
     }
 
+    /// <summary>
+    ///     Gets the number of complete packets in the receive queue.
+    ///     Used to approximate memory usage against the receive window (_rcv_wnd) limit,
+    ///     although fragments also consume slots.
+    /// </summary>
     public int GetQueueSize()
     {
         return _completedPacketsCount;
