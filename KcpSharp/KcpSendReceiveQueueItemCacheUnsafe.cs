@@ -1,6 +1,9 @@
 namespace KcpSharp;
 
+using System;
+
 // REQUIRES: caller must ensure thread safety (e.g., holding _syncRoot in KcpSendQueue or KcpReceiveQueue) when accessing this cache.
+[Obsolete("No longer used by KcpReceiveQueue.")]
 internal sealed class KcpSendReceiveQueueItemCacheUnsafe
 {
     private const int MaxCapacity = 4096;

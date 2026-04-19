@@ -60,7 +60,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private uint _incr;
 
 
-    private readonly KcpSendReceiveQueueItemCacheUnsafe _receiveQueueItemCache;
     private readonly KcpSendQueue _sendQueue;
     private readonly KcpReceiveQueue _receiveQueue;
 
@@ -231,15 +230,14 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         int maxWaitListSize = Math.Max((int)_rcv_wnd, 256);
         _updateActivation = new KcpConversationUpdateActivation((int)_interval, maxWaitListSize);
-        _receiveQueueItemCache = new KcpSendReceiveQueueItemCacheUnsafe();
         _sendQueue = new KcpSendQueue(_bufferPool, _updateActivation, StreamMode,
             options is null || options.SendQueueSize <= 0
                 ? KcpConversationOptions.SendQueueSizeDefaultValue
                 : options.SendQueueSize, _mss);
-        _receiveQueue = new KcpReceiveQueue(StreamMode,
-            options is null || options.ReceiveQueueSize <= 0
-                ? KcpConversationOptions.ReceiveQueueSizeDefaultValue
-                : options.ReceiveQueueSize, _receiveQueueItemCache);
+
+        // Pass rcvBufCapacity (already a power-of-two, computed above).
+        // The ring buffer pre-allocates exactly enough slots for the receive window.
+        _receiveQueue = new KcpReceiveQueue(StreamMode, rcvBufCapacity);
         int batchSizeForFlush = Math.Min(Math.Max((int)_snd_wnd, 32), 256);
         _cachedBatchHeaders = new KcpPacketHeader[batchSizeForFlush];
         _cachedBatchData = new KcpBuffer[batchSizeForFlush];
@@ -1034,8 +1032,9 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             // periodic window notification
-            if (!anyPacketSent && ShouldSendWindowSize(current) && ((KcpProbeType)_probe & KcpProbeType.AskTell) == 0)
+            if (!anyPacketSent && ShouldSendWindowSize(current))
             {
+                // _probe was already exchanged to 0 above; AskTell cannot be set here.
                 if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
                 {
                     buffer.Span.Slice(size, postBufferSize).Clear();
