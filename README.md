@@ -56,14 +56,11 @@ public class PureKcpExample
         // ==============================================================
         // 2. USE THE FLUENT BUILDER (Auto-creates optimized Socket)
         // ==============================================================
-        await using IKcpConversation conversation = KcpBuilder.ForConversation()
+        IKcpConversation conversation = KcpBuilder.ForConversation()
             .WithRemoteEndPoint(remoteEndPoint)
-            .WithUdpSocket(AddressFamily.InterNetwork, out Socket udpSocket)
+            .WithUdpSocket(new IPEndPoint(IPAddress.Any, 0), AddressFamily.InterNetwork, out Socket udpSocket)
             .WithOptions(options)
             .Build();
-
-        // Bind the auto-generated UDP socket
-        udpSocket.Bind(new IPEndPoint(IPAddress.Any, 0));
 
         Console.WriteLine("KCP ready!");
 
