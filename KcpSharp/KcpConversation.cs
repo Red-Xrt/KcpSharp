@@ -1758,12 +1758,15 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 _incr = incr;
             }
 
-            originalBuffer?.Dispose();
             return mutated;
         }
         catch
         {
-            return mutated;
+            throw;
+        }
+        finally
+        {
+            originalBuffer?.Dispose();
         }
     }
 
