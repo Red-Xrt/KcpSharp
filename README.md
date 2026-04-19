@@ -16,7 +16,6 @@ KcpSharp is a production-grade, zero-allocation C# implementation of the [KCP pr
 - [Advanced Patterns](#advanced-patterns)
 - [Internal Architecture](#internal-architecture)
 - [Platform Specifics](#platform-specifics)
-- [Metrics](#metrics)
 - [Acknowledgements](#acknowledgements)
 
 ---
@@ -206,18 +205,6 @@ Inject an `IKcpBufferPool` to provide `GC.AllocateUninitializedArray<byte>(..., 
 
 - **Linux**: Aggressive `recvmmsg(2)` and `sendmmsg(2)` batching with stack-allocated headers mapped to an asynchronous `LongRunning` thread pool task.
 - **Windows**: High-priority synchronous `ReceiveFrom` + `Poll` thread, with concurrent non-batched `Socket.SendToAsync` equivalents. Automatically manages `SIO_UDP_CONNRESET`.
-
----
-
-## Metrics
-
-KcpSharp exposes real-time `System.Diagnostics.Metrics` via the `HyacineCore.Server.Kcp` meter:
-
-- `kcp.retransmission.count`: RTO expiry retransmits.
-- `kcp.fast_retransmission.count`: Fast-retransmits.
-- `kcp.rtt.ms`: Measured round-trip-time (Histogram).
-- `kcp.packets_dropped.count`: App receive queue overflows.
-- `kcp.ack_dropped.count`: Acknowledge ring buffer overflows.
 
 ---
 
