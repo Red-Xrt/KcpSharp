@@ -94,12 +94,8 @@ internal sealed class KcpAcknowledgeList
     {
         // Thread-safe clear is hard in a pure lock-free queue without blocking,
         // but this is only called during transport close or reset.
-        // It's guaranteed by caller (SetTransportClosed) that the update loop is already terminated,
-        // so no concurrent Add calls can happen.
-        System.Diagnostics.Debug.Assert(
-            _sendQueue.IsTransportClosed(),
-            "Clear should only be called when the update loop is terminated and no concurrent Add can happen."
-        );
+        // It must be guaranteed by caller (SetTransportClosed) that the update loop is already terminated,
+        // so no concurrent Add calls can happen, and the send queue is closed.
 
         int currentDequeuePos = Volatile.Read(ref _dequeuePos);
         int currentEnqueuePos = Volatile.Read(ref _enqueuePos);

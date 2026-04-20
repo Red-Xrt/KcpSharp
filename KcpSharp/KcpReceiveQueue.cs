@@ -427,10 +427,12 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
     {
         bool executeSetException = false;
         Exception? exceptionToSet = null;
+        int operationMode = 0;
         lock (_syncRoot)
         {
             if (_activeWait && !_signaled)
             {
+                operationMode = _operationMode;
                 ClearPreviousOperation(true);
                 exceptionToSet = ThrowHelper.NewOperationCanceledExceptionForCancelPendingReceive(innerException, cancellationToken);
                 executeSetException = true;
@@ -439,11 +441,11 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
 
         if (executeSetException)
         {
-            if (_operationMode == 0 || _operationMode == 1 || _operationMode == 3)
+            if (operationMode == 0 || operationMode == 1 || operationMode == 3)
                 _mrvtsc.SetException(exceptionToSet!);
-            else if (_operationMode == 2)
+            else if (operationMode == 2)
                 _mrvtscBool.SetException(exceptionToSet!);
-            else if (_operationMode == 4)
+            else if (operationMode == 4)
                 _mrvtscInt.SetException(exceptionToSet!);
             return true;
         }

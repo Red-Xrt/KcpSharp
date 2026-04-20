@@ -293,7 +293,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                                         int error = Marshal.GetLastWin32Error();
                                         // Handle EINTR or EAGAIN/EWOULDBLOCK if needed, here we just throw or fallback
                                         if (error == 4 /* EINTR */) continue;
-                                        if (error == 11 /* EAGAIN */ || error == 35 /* EWOULDBLOCK on macOS */ || error == 14 /* EWOULDBLOCK on some Linux */)
+                                        if (error == 11 /* EAGAIN */ || error == 35 /* EWOULDBLOCK on macOS */)
                                         {
                                             // Drop the batch or retry with a yield — UDP has no reliability guarantee anyway
                                             break; // packet loss is acceptable; let KCP RTO handle retransmit
@@ -743,7 +743,7 @@ private async Task RunReceiveLoopLinuxAsync()
                         if (ret < 0)
                         {
                             int error = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
-                            if (error == 4 /* EINTR */ || error == 11 /* EAGAIN */ || error == 14 /* EWOULDBLOCK */) continue;
+                            if (error == 4 /* EINTR */ || error == 11 /* EAGAIN */) continue;
 
                             if (error == 104 /* ECONNRESET */) continue;
                             throw new SocketException(error);
