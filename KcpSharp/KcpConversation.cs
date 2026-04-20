@@ -123,6 +123,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     internal KcpConversation(IPEndPoint remoteEndpoint, IKcpTransport transport, uint? conversationId,
         KcpConversationOptions? options)
     {
+        options?.Validate();
         _bufferPool = options?.BufferPool ?? DefaultArrayPoolBufferAllocator.Default;
         _transport = transport;
         _remoteEndPoint = remoteEndpoint;
@@ -548,6 +549,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         // This avoids delaying time-critical ACKs when data flush is congested.
         bool ackPushed = await FlushAcksFastAsync(cancellationToken).ConfigureAwait(false);
 
+        s_currentObject = this;  // re-set after resumption on the new thread
+
         // 2. Main data flush loop (semaphore protected)
         await FlushCore2Async(ackPushed, cancellationToken).ConfigureAwait(false);
     }
@@ -743,6 +746,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 }
                 finally
                 {
+                    // Release any successfully dequeued items that were NOT processed (e.g., due to an exception like aliasing throw)
+                    for (int i = processedCount; i < dequeuedCount; i++)
+                    {
+                        dequeueBufferArray[i].Item1.Release();
+                    }
 
                     // Clear references so memory can be GC'd when done
                     Array.Clear(dequeueBufferArray, 0, dequeuedCount);
@@ -889,7 +897,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
                                 // Snapshot for out-of-lock encoding
                                 batchHeaders[batchCount] = header;
-                                batchData[batchCount] = data;
+                                batchData[batchCount] = data.Retain();
                                 batchCount++;
                             }
 
@@ -916,6 +924,9 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                             data.DataRegion.CopyTo(buffer.Slice(size));
                             size += data.Length;
                         }
+
+                        // Release the reference we retained inside the lock
+                        data.Release();
                     }
 
                     // ArrayPool no longer used, using pre-allocated arrays
@@ -1021,6 +1032,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 KcpPacketHeader header = new(KcpCommand.WindowSize, 0, windowSize, 0, 0, unacknowledged);
                 header.EncodeHeader(_id, 0, buffer.Span.Slice(size), out var bytesWritten);
                 size += bytesWritten;
+
+                if (_receiveWindowNotificationOptions is not null)
+                {
+                    _ts_rcv_notify_wait = 0;
+                    _ts_rcv_notify = current + (uint)_receiveWindowNotificationOptions.InitialInterval;
+                }
             }
 
             // periodic window notification
@@ -1133,7 +1150,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         return;
                     }
                     if (batch is not null)
+                    {
                         await batch.FlushBatchAsync(cancellationToken).ConfigureAwait(false);
+                        _lastSendTick = GetTimestamp();
+                    }
                     size = preBufferSize;
                     if (preBufferSize > 0)
                     {
@@ -2213,6 +2233,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     ///     In tests or fast-restart scenarios where flush buffers might be reused immediately, use <see cref="DisposeAsync"/> instead.
     ///     </para>
     /// </summary>
+    [Obsolete("Warning: Background buffer teardown is asynchronous and not guaranteed to be complete upon return. In scenarios with high churn, use DisposeAsync() instead.")]
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
@@ -2221,10 +2242,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         try { _sendQueue.Dispose(); } catch { }
         try { _receiveQueue.Dispose(); } catch { }
 
-        // Start background tear down for the main tasks to avoid blocking synchronous Dispose.
-        // Waiting synchronously in Dispose causes thread-pool starvation.
-        // Warning: this is fire-and-forget; potential use-after-free can occur if pre-allocated buffers are reused immediately.
-        _ = DisposeBackgroundTasksAsync();
+        // We explicitly do not await background tasks here to avoid thread-pool starvation.
+        // The [Obsolete] attribute warns callers to use DisposeAsync() for safe teardown.
     }
 
     public async ValueTask DisposeAsync()

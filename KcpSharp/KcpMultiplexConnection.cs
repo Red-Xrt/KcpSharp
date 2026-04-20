@@ -198,7 +198,9 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         }
         finally
         {
+#pragma warning disable CS0618
             if (conversation is not null) conversation.Dispose();
+#pragma warning restore CS0618
         }
     }
 
@@ -224,7 +226,9 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         }
         finally
         {
+#pragma warning disable CS0618
             if (conversation is not null) conversation.Dispose();
+#pragma warning restore CS0618
         }
     }
 

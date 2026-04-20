@@ -29,6 +29,26 @@ internal struct KcpBuffer
         return new KcpBuffer(buffer, slice, length);
     }
 
+    internal KcpBuffer Retain()
+    {
+        if (_owner is IRefCountedBuffer refCounted)
+        {
+            return new KcpBuffer(refCounted.Retain(), _memory, Length);
+        }
+        else if (_owner is null)
+        {
+            return this; // No owner to retain, safe to pass along
+        }
+        else
+        {
+            // Owner doesn't support ref-counting (e.g. ArrayPool without a shared owner wrapper).
+            // We must defensively duplicate the buffer memory to ensure the copy outlives the original.
+            var rented = System.Buffers.ArrayPool<byte>.Shared.Rent(Length);
+            _memory.Span.Slice(0, Length).CopyTo(rented.AsSpan(0, Length));
+            return new KcpBuffer(System.Buffers.ArrayPool<byte>.Shared, rented, Length);
+        }
+    }
+
     internal KcpBuffer AppendData(ReadOnlySpan<byte> data)
     {
         if (Length + data.Length > _memory.Length) ThrowRentedBufferTooSmall();

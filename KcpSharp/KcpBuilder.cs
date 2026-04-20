@@ -131,6 +131,15 @@ public sealed class KcpBuilder
         if (_remoteEndPoint == null)
             throw new InvalidOperationException("RemoteEndPoint is required.");
 
+        if (_socket != null && _socket.AddressFamily != _remoteEndPoint.AddressFamily)
+        {
+            // Allow DualMode sockets (IPv6 socket talking to IPv4 mapped address)
+            if (!(_socket.AddressFamily == AddressFamily.InterNetworkV6 && _socket.DualMode))
+            {
+                throw new InvalidOperationException("The socket's AddressFamily must match the RemoteEndPoint's AddressFamily.");
+            }
+        }
+
         KcpConversation conversation;
 
         if (_socket != null)

@@ -228,5 +228,17 @@ public class KcpConversationOptions
             throw new ArgumentException("SendWindow must be greater than zero.", nameof(SendWindow));
         if (ReceiveWindow <= 0)
             throw new ArgumentException("ReceiveWindow must be greater than zero.", nameof(ReceiveWindow));
+
+        if (SendQueueSize < 1 && SendQueueSize != 0) // Allows 0 to fallback to default later, but <0 is invalid
+            throw new ArgumentException("SendQueueSize must be greater than zero.", nameof(SendQueueSize));
+        if (ReceiveQueueSize < 1 && ReceiveQueueSize != 0) // Allows 0 to fallback to default later, but <0 is invalid
+            throw new ArgumentException("ReceiveQueueSize must be greater than zero.", nameof(ReceiveQueueSize));
+
+        _ = MaxBatchSize; // trigger validation in property getter/setter
+
+        if (InitialSsthresh < 2)
+            throw new ArgumentException("InitialSsthresh must be at least 2.", nameof(InitialSsthresh));
+        if (RemoteReceiveWindow < 1)
+            throw new ArgumentException("RemoteReceiveWindow must be at least 1.", nameof(RemoteReceiveWindow));
     }
 }

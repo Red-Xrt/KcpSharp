@@ -229,8 +229,8 @@ internal sealed class KcpReceiveRingBuffer : IDisposable
 
     private readonly Slot[] _slots;
     private readonly int _mask;
-    private int _head;
-    private int _tail;
+    private volatile int _head;
+    private volatile int _tail;
     private SpinLock _spinLock = new SpinLock(false);
 
     public KcpReceiveRingBuffer(int capacity)

@@ -114,11 +114,6 @@ internal static class KcpGlobalTickEngine
 #pragma warning disable CS0420
             Volatile.Write(ref entry._unregisteredRef, 1);
 #pragma warning restore CS0420
-            int slot = entry.CurrentWheelSlot;
-            lock (s_wheelLocks[slot])
-            {
-                s_wheel[slot].Remove(activation);
-            }
         }
     }
 
@@ -231,12 +226,15 @@ internal static class KcpGlobalTickEngine
                                     activation.Notify();
                                 }
 
-                                // Re-insert into the wheel for the next tick
-                                int nextSlot = GetSlot(entry.NextTick);
-                                entry.CurrentWheelSlot = nextSlot;
-                                lock (s_wheelLocks[nextSlot])
+                                if (!entry.Unregistered)
                                 {
-                                    s_wheel[nextSlot].Add(activation);
+                                    // Re-insert into the wheel for the next tick
+                                    int nextSlot = GetSlot(entry.NextTick);
+                                    entry.CurrentWheelSlot = nextSlot;
+                                    lock (s_wheelLocks[nextSlot])
+                                    {
+                                        s_wheel[nextSlot].Add(activation);
+                                    }
                                 }
                             }
                         }

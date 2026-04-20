@@ -208,7 +208,9 @@ public sealed class KcpStream : Stream
     /// <inheritdoc />
     protected override void Dispose(bool disposing)
     {
+#pragma warning disable CS0618
         if (disposing && _ownsConversation) _conversation?.Dispose();
+#pragma warning restore CS0618
         _conversation = null;
         base.Dispose(disposing);
     }
@@ -285,7 +287,9 @@ public sealed class KcpStream : Stream
     {
         if (_conversation is not null)
         {
+#pragma warning disable CS0618
             _conversation.Dispose();
+#pragma warning restore CS0618
             _conversation = null;
         }
 
