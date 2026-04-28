@@ -283,17 +283,15 @@ public sealed class KcpStream : Stream
     ///     Asynchronously releases the resources used by the <see cref="KcpStream" />.
     /// </summary>
     /// <returns>A task that represents the asynchronous dispose operation.</returns>
-    public override ValueTask DisposeAsync()
+    public override async ValueTask DisposeAsync()
     {
         if (_conversation is not null)
         {
-#pragma warning disable CS0618
-            _conversation.Dispose();
-#pragma warning restore CS0618
+            await _conversation.DisposeAsync().ConfigureAwait(false);
             _conversation = null;
         }
 
-        return base.DisposeAsync();
+        await base.DisposeAsync().ConfigureAwait(false);
     }
 
     /// <inheritdoc />

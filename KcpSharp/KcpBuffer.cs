@@ -88,12 +88,10 @@ internal struct KcpBuffer
         {
             new KcpRentedBuffer(owner, _memory).Dispose();
         }
-#if DEBUG
         else
         {
-            System.Diagnostics.Debug.Fail("KcpBuffer.Release() called on already-released buffer");
+            throw new ObjectDisposedException(nameof(KcpBuffer), "KcpBuffer.Release() called on already-released buffer");
         }
-#endif
     }
 
     private static void ThrowRentedBufferTooSmall()

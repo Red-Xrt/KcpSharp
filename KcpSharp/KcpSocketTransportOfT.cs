@@ -400,20 +400,32 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     {
         if (socket.AddressFamily == AddressFamily.InterNetworkV6)
         {
-            try { socket.DualMode = true; } catch { }
+            try { socket.DualMode = true; }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Failed to set DualMode on IPv6 socket: {ex.Message}");
+            }
         }
+
         try
         {
+            // Some environments/OS policies restrict modifying PMTUD behavior (e.g. Docker, some cloud providers)
             socket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.DontFragment, true);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Failed to set DontFragment (PMTUD may be active or option is restricted): {ex.Message}");
+        }
 
         try
         {
             socket.SendBufferSize = 4 * 1024 * 1024;
             socket.ReceiveBufferSize = 4 * 1024 * 1024;
         }
-        catch (SocketException) { }
+        catch (SocketException ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"Failed to set socket buffer sizes: {ex.Message}");
+        }
         catch (ObjectDisposedException) { }
 
         if (OperatingSystem.IsWindows())
@@ -751,6 +763,13 @@ private async Task RunReceiveLoopLinuxAsync()
 
                         for (int i = 0; i < ret; i++)
                         {
+                            // Check for MSG_TRUNC (0x20) flag. If set, the packet was larger than our buffer and truncated.
+                            // Processing a truncated packet can lead to parsing errors or injection attacks.
+                            if ((pMsgvec[i].msg_hdr.msg_flags & 0x20) != 0)
+                            {
+                                continue;
+                            }
+
                             uint bytesReceived = pMsgvec[i].msg_len;
                             if (bytesReceived < KcpGlobalVars.HEADER_LENGTH_WITHOUT_CONVID)
                             {

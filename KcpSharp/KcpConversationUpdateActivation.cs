@@ -110,9 +110,9 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
 
             if (_ringBuffer.TryDequeue(out var packet, out var bufferOwner))
             {
-                bool hasTimer = _notificationPending;
-                _notificationPending = false;
-                return new ValueTask<KcpConversationUpdateNotification>(new KcpConversationUpdateNotification(packet, bufferOwner, !hasTimer));
+                // We return the packet, but if a timer notification is pending, we leave it pending
+                // so that the update loop will process it when draining packets finishes.
+                return new ValueTask<KcpConversationUpdateNotification>(new KcpConversationUpdateNotification(packet, bufferOwner, true));
             }
 
             if (_notificationPending)
