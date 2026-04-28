@@ -229,8 +229,8 @@ internal sealed class KcpReceiveRingBuffer : IDisposable
 
     private readonly Slot[] _slots;
     private readonly int _mask;
-    private volatile int _head;
-    private volatile int _tail;
+    private volatile uint _head;
+    private volatile uint _tail;
     private SpinLock _spinLock = new SpinLock(false);
 
     public KcpReceiveRingBuffer(int capacity)
@@ -248,7 +248,7 @@ internal sealed class KcpReceiveRingBuffer : IDisposable
         {
             _spinLock.Enter(ref lockTaken);
             if (_disposed) return false;
-            if (_tail - _head >= _slots.Length) return false;
+            if (_tail - _head >= (uint)_slots.Length) return false;
 
             _slots[_tail & _mask] = new Slot(packet, owner);
             _tail++;
@@ -273,7 +273,7 @@ internal sealed class KcpReceiveRingBuffer : IDisposable
                 return false;
             }
 
-            int index = _head & _mask;
+            uint index = _head & (uint)_mask;
             var slot = _slots[index];
             packet = slot.Packet;
             owner = slot.Owner;
@@ -297,8 +297,8 @@ internal sealed class KcpReceiveRingBuffer : IDisposable
         {
             _spinLock.Enter(ref lockTaken);
             _disposed = true;
-            int head = _head;
-            int tail = _tail;
+            uint head = _head;
+            uint tail = _tail;
 
             while (head != tail)
             {

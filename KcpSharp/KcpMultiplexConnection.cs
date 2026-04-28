@@ -18,7 +18,12 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
     private readonly IKcpBatchTransport? _batchTransport;
     private volatile bool _disposed;
     private volatile bool _transportClosed;
-    private int _disposeFlag;
+    private const int NotDisposed = 0;
+    private const int DisposingSync = 1;
+    private const int DisposingAsync = 2;
+    private const int Disposed = 3;
+    private int _disposeState;
+    private TaskCompletionSource? _disposeCompletion;
 
     /// <summary>
     ///     Initializes a new instance of the <see cref="KcpMultiplexConnection{T}"/> class using the specified transport.
@@ -94,7 +99,21 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref _disposeFlag, 1) == 1) return;
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var prev = Interlocked.CompareExchange(ref _disposeCompletion, tcs, null);
+        var activeTcs = prev ?? tcs;
+
+        var previousState = Interlocked.CompareExchange(ref _disposeState, DisposingAsync, NotDisposed);
+
+        if (previousState != NotDisposed)
+        {
+            if (previousState == DisposingSync || previousState == DisposingAsync)
+            {
+                await activeTcs.Task.ConfigureAwait(false);
+            }
+            return;
+        }
+
         _transportClosed = true;
         _disposed = true;
         while (!_conversations.IsEmpty)
@@ -115,11 +134,28 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
                     if (_disposeAction is not null) _disposeAction.Invoke(value.State);
                 }
         }
+
+        Interlocked.Exchange(ref _disposeState, Disposed);
+        activeTcs.TrySetResult();
     }
 
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref _disposeFlag, 1) == 1) return;
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var prev = Interlocked.CompareExchange(ref _disposeCompletion, tcs, null);
+        var activeTcs = prev ?? tcs;
+
+        var previousState = Interlocked.CompareExchange(ref _disposeState, DisposingSync, NotDisposed);
+
+        if (previousState != NotDisposed)
+        {
+            if (previousState == DisposingAsync || previousState == DisposingSync)
+            {
+                activeTcs.Task.GetAwaiter().GetResult();
+            }
+            return;
+        }
+
         _transportClosed = true;
         _disposed = true;
         while (!_conversations.IsEmpty)
@@ -133,6 +169,9 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
                     if (_disposeAction is not null) _disposeAction.Invoke(value.State);
                 }
         }
+
+        Interlocked.Exchange(ref _disposeState, Disposed);
+        activeTcs.TrySetResult();
     }
 
     /// <summary>

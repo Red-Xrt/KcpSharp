@@ -939,6 +939,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         {
                             batchData[i].Release();
                         }
+                        Array.Clear(batchData, 0, batchCount);
                         batchCount = 0;
                     }
 
