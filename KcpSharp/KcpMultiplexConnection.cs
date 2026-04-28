@@ -94,8 +94,27 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        Dispose();
-        await System.Threading.Tasks.Task.CompletedTask;
+        if (Interlocked.Exchange(ref _disposeFlag, 1) == 1) return;
+        _transportClosed = true;
+        _disposed = true;
+        while (!_conversations.IsEmpty)
+        {
+            var keys = _conversations.Keys.ToArray();
+            if (keys.Length == 0) break;
+            foreach (var id in keys)
+                if (_conversations.TryRemove(id, out var value))
+                {
+                    if (value.Conversation is IAsyncDisposable asyncDisposable)
+                    {
+                        await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        value.Conversation.Dispose();
+                    }
+                    if (_disposeAction is not null) _disposeAction.Invoke(value.State);
+                }
+        }
     }
 
     public void Dispose()
@@ -147,7 +166,14 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         }
         finally
         {
-            if (channel is not null) channel.Dispose();
+            if (channel is not null)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try { await channel.DisposeAsync().ConfigureAwait(false); }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Failed to dispose channel: {ex.Message}"); }
+                });
+            }
         }
     }
 
@@ -173,7 +199,14 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         }
         finally
         {
-            if (channel is not null) channel.Dispose();
+            if (channel is not null)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try { await channel.DisposeAsync().ConfigureAwait(false); }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Failed to dispose channel: {ex.Message}"); }
+                });
+            }
         }
     }
 
@@ -198,9 +231,15 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         }
         finally
         {
-#pragma warning disable CS0618
-            if (conversation is not null) conversation.Dispose();
-#pragma warning restore CS0618
+            if (conversation is not null)
+            {
+                // To avoid deadlocks synchronously calling DisposeAsync
+                _ = Task.Run(async () =>
+                {
+                    try { await conversation.DisposeAsync().ConfigureAwait(false); }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Failed to dispose conversation: {ex.Message}"); }
+                });
+            }
         }
     }
 
@@ -226,9 +265,15 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         }
         finally
         {
-#pragma warning disable CS0618
-            if (conversation is not null) conversation.Dispose();
-#pragma warning restore CS0618
+            if (conversation is not null)
+            {
+                // To avoid deadlocks synchronously calling DisposeAsync
+                _ = Task.Run(async () =>
+                {
+                    try { await conversation.DisposeAsync().ConfigureAwait(false); }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Failed to dispose conversation: {ex.Message}"); }
+                });
+            }
         }
     }
 
