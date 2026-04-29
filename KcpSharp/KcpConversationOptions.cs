@@ -122,9 +122,9 @@ public class KcpConversationOptions
         get => _maxBatchSize;
         set
         {
-            if (value < 1 || value > 1024)
+            if (value < 0 || value > 1024)
             {
-                throw new ArgumentOutOfRangeException(nameof(value), "MaxBatchSize must be between 1 and 1024.");
+                throw new ArgumentOutOfRangeException(nameof(value), "MaxBatchSize must be between 0 and 1024.");
             }
             _maxBatchSize = value;
         }

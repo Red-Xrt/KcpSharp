@@ -18,7 +18,12 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
     private readonly IKcpBatchTransport? _batchTransport;
     private volatile bool _disposed;
     private volatile bool _transportClosed;
-    private int _disposeFlag;
+    private const int NotDisposed = 0;
+    private const int DisposingSync = 1;
+    private const int DisposingAsync = 2;
+    private const int Disposed = 3;
+    private int _disposeState;
+    private TaskCompletionSource? _disposeCompletion;
 
     /// <summary>
     ///     Initializes a new instance of the <see cref="KcpMultiplexConnection{T}"/> class using the specified transport.
@@ -94,13 +99,63 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        Dispose();
-        await System.Threading.Tasks.Task.CompletedTask;
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var prev = Interlocked.CompareExchange(ref _disposeCompletion, tcs, null);
+        var activeTcs = prev ?? tcs;
+
+        var previousState = Interlocked.CompareExchange(ref _disposeState, DisposingAsync, NotDisposed);
+
+        if (previousState != NotDisposed)
+        {
+            if (previousState == DisposingSync || previousState == DisposingAsync)
+            {
+                await activeTcs.Task.ConfigureAwait(false);
+            }
+            return;
+        }
+
+        _transportClosed = true;
+        _disposed = true;
+        while (!_conversations.IsEmpty)
+        {
+            var keys = _conversations.Keys.ToArray();
+            if (keys.Length == 0) break;
+            foreach (var id in keys)
+                if (_conversations.TryRemove(id, out var value))
+                {
+                    if (value.Conversation is IAsyncDisposable asyncDisposable)
+                    {
+                        await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        value.Conversation.Dispose();
+                    }
+                    if (_disposeAction is not null) _disposeAction.Invoke(value.State);
+                }
+        }
+
+        Interlocked.Exchange(ref _disposeState, Disposed);
+        activeTcs.TrySetResult();
     }
 
     public void Dispose()
     {
-        if (Interlocked.Exchange(ref _disposeFlag, 1) == 1) return;
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var prev = Interlocked.CompareExchange(ref _disposeCompletion, tcs, null);
+        var activeTcs = prev ?? tcs;
+
+        var previousState = Interlocked.CompareExchange(ref _disposeState, DisposingSync, NotDisposed);
+
+        if (previousState != NotDisposed)
+        {
+            if (previousState == DisposingAsync || previousState == DisposingSync)
+            {
+                activeTcs.Task.GetAwaiter().GetResult();
+            }
+            return;
+        }
+
         _transportClosed = true;
         _disposed = true;
         while (!_conversations.IsEmpty)
@@ -114,6 +169,9 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
                     if (_disposeAction is not null) _disposeAction.Invoke(value.State);
                 }
         }
+
+        Interlocked.Exchange(ref _disposeState, Disposed);
+        activeTcs.TrySetResult();
     }
 
     /// <summary>
@@ -147,7 +205,14 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         }
         finally
         {
-            if (channel is not null) channel.Dispose();
+            if (channel is not null)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try { await channel.DisposeAsync().ConfigureAwait(false); }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Failed to dispose channel: {ex.Message}"); }
+                });
+            }
         }
     }
 
@@ -173,7 +238,14 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         }
         finally
         {
-            if (channel is not null) channel.Dispose();
+            if (channel is not null)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try { await channel.DisposeAsync().ConfigureAwait(false); }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Failed to dispose channel: {ex.Message}"); }
+                });
+            }
         }
     }
 
@@ -198,9 +270,15 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         }
         finally
         {
-#pragma warning disable CS0618
-            if (conversation is not null) conversation.Dispose();
-#pragma warning restore CS0618
+            if (conversation is not null)
+            {
+                // To avoid deadlocks synchronously calling DisposeAsync
+                _ = Task.Run(async () =>
+                {
+                    try { await conversation.DisposeAsync().ConfigureAwait(false); }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Failed to dispose conversation: {ex.Message}"); }
+                });
+            }
         }
     }
 
@@ -226,9 +304,15 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         }
         finally
         {
-#pragma warning disable CS0618
-            if (conversation is not null) conversation.Dispose();
-#pragma warning restore CS0618
+            if (conversation is not null)
+            {
+                // To avoid deadlocks synchronously calling DisposeAsync
+                _ = Task.Run(async () =>
+                {
+                    try { await conversation.DisposeAsync().ConfigureAwait(false); }
+                    catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"Failed to dispose conversation: {ex.Message}"); }
+                });
+            }
         }
     }
 

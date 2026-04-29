@@ -30,8 +30,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private volatile uint _snd_una;
     private volatile uint _snd_nxt;
     private volatile uint _rcv_nxt;
-    private volatile uint _max_ack_sn;
-    private volatile int _max_ack_has_value;
+    private long _max_ack_sn_and_flag;
 
     private uint _ssthresh;
 
@@ -801,9 +800,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                         int processed = 0;
 
                         #pragma warning disable CS0420
-                        bool hasMaxAck = Volatile.Read(ref _max_ack_has_value) == 1;
-                        uint maxAckSn = Volatile.Read(ref _max_ack_sn);
+                        long packedMaxAck = Volatile.Read(ref _max_ack_sn_and_flag);
 #pragma warning restore CS0420
+                        bool hasMaxAck = (packedMaxAck & 0x100000000L) != 0;
+                        uint maxAckSn = (uint)packedMaxAck;
 
                         while (nextSn.HasValue && TimeDiff(nextSn.Value, _snd_nxt) < 0 && processed < BatchSize)
                         {
@@ -911,22 +911,36 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                     } // Unlock _sndBufLock
 
                     // Encode outside lock (H-1)
-                    for (int i = 0; i < batchCount; i++)
+                    int encodedCount = 0;
+                    try
                     {
-                        var header = batchHeaders[i];
-                        var data = batchData[i];
-
-                        header.EncodeHeader(_id, data.Length, buffer.Span.Slice(size), out var bytesWritten);
-                        size += bytesWritten;
-
-                        if (data.Length > 0)
+                        for (int i = 0; i < batchCount; i++)
                         {
-                            data.DataRegion.CopyTo(buffer.Slice(size));
-                            size += data.Length;
-                        }
+                            var header = batchHeaders[i];
+                            var data = batchData[i];
 
-                        // Release the reference we retained inside the lock
-                        data.Release();
+                            header.EncodeHeader(_id, data.Length, buffer.Span.Slice(size), out var bytesWritten);
+                            size += bytesWritten;
+
+                            if (data.Length > 0)
+                            {
+                                data.DataRegion.CopyTo(buffer.Slice(size));
+                                size += data.Length;
+                            }
+
+                            // Release the reference we retained inside the lock
+                            data.Release();
+                            encodedCount++;
+                        }
+                    }
+                    finally
+                    {
+                        for (int i = encodedCount; i < batchCount; i++)
+                        {
+                            batchData[i].Release();
+                        }
+                        Array.Clear(batchData, 0, batchCount);
+                        batchCount = 0;
                     }
 
                     // ArrayPool no longer used, using pre-allocated arrays
@@ -1043,7 +1057,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             // periodic window notification
             if (!anyPacketSent && ShouldSendWindowSize(current))
             {
-                // _probe was already exchanged to 0 above; AskTell cannot be set here.
+                // Note: AskTell CAN be set here by a concurrent receive thread calling UpdateProbeThreadSafe.
+                // If it happens, the bit will be picked up on the next flush cycle.
                 if (size + packetHeaderSize > sizeLimitBeforePostBuffer)
                 {
                     buffer.Span.Slice(size, postBufferSize).Clear();
@@ -1094,6 +1109,9 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             // update sshthresh
             if (lost)
             {
+                cwnd = Math.Min(_snd_wnd, Volatile.Read(ref _rmt_wnd));
+                if (!_nocwnd) cwnd = Math.Min(_cwnd, cwnd);
+
                 _ssthresh = Math.Max(cwnd / 2, IKCP_THRESH_MIN);
                 updatedCwnd = 1;
                 incr = (uint)_mss;
@@ -1559,15 +1577,18 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 while (true)
                 {
 #pragma warning disable CS0420
-                    var currentMaxAck = Volatile.Read(ref _max_ack_sn);
-                    if (Volatile.Read(ref _max_ack_has_value) == 1 && TimeDiff(maxack, currentMaxAck) <= 0) break;
+                    long currentPacked = Volatile.Read(ref _max_ack_sn_and_flag);
+                    bool hasValue = (currentPacked & 0x100000000L) != 0;
+                    uint currentMaxAck = (uint)currentPacked;
 
-                    if (Interlocked.CompareExchange(ref _max_ack_sn, maxack, currentMaxAck) == currentMaxAck)
+                    if (hasValue && TimeDiff(maxack, currentMaxAck) <= 0) break;
+
+                    long newPacked = 0x100000000L | maxack;
+                    if (Interlocked.CompareExchange(ref _max_ack_sn_and_flag, newPacked, currentPacked) == currentPacked)
                     {
-                        Volatile.Write(ref _max_ack_has_value, 1);
-#pragma warning restore CS0420
                         break;
                     }
+#pragma warning restore CS0420
                 }
             }
 
@@ -1730,15 +1751,18 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 while (true)
                 {
                     #pragma warning disable CS0420
-                    var currentMaxAck = Volatile.Read(ref _max_ack_sn);
-                    if (Volatile.Read(ref _max_ack_has_value) == 1 && TimeDiff(maxack, currentMaxAck) <= 0) break;
+                    long currentPacked = Volatile.Read(ref _max_ack_sn_and_flag);
+                    bool hasValue = (currentPacked & 0x100000000L) != 0;
+                    uint currentMaxAck = (uint)currentPacked;
 
-                    if (Interlocked.CompareExchange(ref _max_ack_sn, maxack, currentMaxAck) == currentMaxAck)
+                    if (hasValue && TimeDiff(maxack, currentMaxAck) <= 0) break;
+
+                    long newPacked = 0x100000000L | maxack;
+                    if (Interlocked.CompareExchange(ref _max_ack_sn_and_flag, newPacked, currentPacked) == currentPacked)
                     {
-                        Volatile.Write(ref _max_ack_has_value, 1);
-#pragma warning restore CS0420
                         break;
                     }
+#pragma warning restore CS0420
                 }
             }
 

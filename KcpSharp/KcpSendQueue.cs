@@ -429,96 +429,112 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         var mss = _mss;
         int originalBufferLength = buffer.Length;
 
-        // In stream mode, the tail slot may already have free bytes; avoid reserving
-        // slots we will immediately release.  Snapshot under lock is not possible here
-        // (we haven't acquired _syncRoot yet), so we use an optimistic estimate:
-        // assume worst case (no tail space) then release excess in the finally block.
-        // For non-stream mode, every byte must occupy its own slot up to mss.
-        int reservedSlots;
-        if (_stream)
-        {
-            // Stream: 0 new slots needed if buffer fits entirely in the tail;
-            // otherwise ceil(remaining / mss).  We over-reserve by at most 1 slot.
-            reservedSlots = originalBufferLength <= mss ? 1 : (originalBufferLength + mss - 1) / mss;
-        }
-        else
-        {
-            reservedSlots = originalBufferLength <= mss ? 1 : (originalBufferLength + mss - 1) / mss;
-            if (reservedSlots > 256)
-                throw new ArgumentException("Message is too large (requires > 256 fragments).", nameof(buffer));
-        }
-
-        try
-        {
-            await _spaceSemaphore.WaitAsync(reservedSlots, cancellationToken).ConfigureAwait(false);
-        }
-        catch (ObjectDisposedException)
-        {
-            return false;
-        }
-
-        if (_transportClosed || _disposed)
-        {
-            try { _spaceSemaphore.Release(reservedSlots); } catch (ObjectDisposedException) { }
-            return false;
-        }
-
-        int usedSlots = 0;
         bool anySegmentAdded = false;
 
-        try
+        if (!_stream && originalBufferLength > 256 * mss)
         {
-            lock (_syncRoot)
-            {
-                if (_transportClosed || _disposed)
-                {
-                    // The finally block handles semaphore release
-                    return false;
-                }
+            throw new ArgumentException("Message is too large (requires > 256 fragments).", nameof(buffer));
+        }
 
-                if (_stream && _queueCount > 0)
+        while (buffer.Length > 0)
+        {
+            int slotsToReserve = 0;
+            if (_stream)
+            {
+                // In stream mode, check if we have space in the tail slot first to avoid over-reservation.
+                lock (_syncRoot)
                 {
-                    int lastIndex = (_queueTail - 1 + _queueArray.Length) % _queueArray.Length;
-                    ref var dataRef = ref _queueArray[lastIndex].Data;
-                    var expand = mss - dataRef.Length;
-                    expand = Math.Min(expand, buffer.Length);
-                    if (expand > 0)
+                    if (_transportClosed || _disposed) return false;
+                    if (_queueCount > 0)
                     {
-                        dataRef = dataRef.AppendData(buffer.Span.Slice(0, expand));
-                        buffer = buffer.Slice(expand);
-                        Interlocked.Add(ref _unflushedBytes, expand);
+                        int lastIndex = (_queueTail - 1 + _queueArray.Length) % _queueArray.Length;
+                        ref var dataRef = ref _queueArray[lastIndex].Data;
+                        var expand = mss - dataRef.Length;
+                        expand = Math.Min(expand, buffer.Length);
+                        if (expand > 0)
+                        {
+                            dataRef = dataRef.AppendData(buffer.Span.Slice(0, expand));
+                            buffer = buffer.Slice(expand);
+                            Interlocked.Add(ref _unflushedBytes, expand);
+                            anySegmentAdded = true;
+                        }
+                    }
+                }
+            }
+
+            if (buffer.Length == 0) break;
+
+            int fragmentsNeeded = buffer.Length <= mss ? 1 : (buffer.Length + mss - 1) / mss;
+            // Reserve exactly what we need, or wait for at least 1 slot if we're looping.
+            slotsToReserve = fragmentsNeeded;
+
+            try
+            {
+                await _spaceSemaphore.WaitAsync(slotsToReserve, cancellationToken).ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
+
+            if (_transportClosed || _disposed)
+            {
+                try { _spaceSemaphore.Release(slotsToReserve); } catch (ObjectDisposedException) { }
+                return false;
+            }
+
+            int usedSlots = 0;
+            try
+            {
+                lock (_syncRoot)
+                {
+                    if (_transportClosed || _disposed)
+                    {
+                        return false;
+                    }
+
+                    // In stream mode, tail could have space freed up since we checked
+                    if (_stream && _queueCount > 0)
+                    {
+                        int lastIndex = (_queueTail - 1 + _queueArray.Length) % _queueArray.Length;
+                        ref var dataRef = ref _queueArray[lastIndex].Data;
+                        var expand = mss - dataRef.Length;
+                        expand = Math.Min(expand, buffer.Length);
+                        if (expand > 0)
+                        {
+                            dataRef = dataRef.AppendData(buffer.Span.Slice(0, expand));
+                            buffer = buffer.Slice(expand);
+                            Interlocked.Add(ref _unflushedBytes, expand);
+                            anySegmentAdded = true;
+                        }
+                    }
+
+                    int currentFragmentIndex = buffer.Length <= mss ? 0 : (buffer.Length + mss - 1) / mss - 1;
+
+                    while (buffer.Length > 0 && usedSlots < slotsToReserve)
+                    {
+                        int size = buffer.Length > mss ? mss : buffer.Length;
+                        var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
+                        var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Span.Slice(0, size));
+                        buffer = buffer.Slice(size);
+
+                        _queueArray[_queueTail] = (kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex);
+                        _queueTail = (_queueTail + 1) % _queueArray.Length;
+                        _queueCount++;
+                        Interlocked.Add(ref _unflushedBytes, size);
+                        usedSlots++;
+                        currentFragmentIndex--;
                         anySegmentAdded = true;
                     }
                 }
-
-                int fragmentsNeeded = buffer.Length <= mss ? 1 : (buffer.Length + mss - 1) / mss;
-                int remainingFragments = fragmentsNeeded;
-                int currentFragmentIndex = fragmentsNeeded - 1; // Count down for fragments
-
-                while (remainingFragments > 0)
-                {
-                    int size = buffer.Length > mss ? mss : buffer.Length;
-                    var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
-                    var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Span.Slice(0, size));
-                    buffer = buffer.Slice(size);
-
-                    _queueArray[_queueTail] = (kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex);
-                    _queueTail = (_queueTail + 1) % _queueArray.Length;
-                    _queueCount++;
-                    Interlocked.Add(ref _unflushedBytes, size);
-                    usedSlots++;
-                    currentFragmentIndex--;
-                    remainingFragments--;
-                    anySegmentAdded = true;
-                }
             }
-        }
-        finally
-        {
-            int unusedSlots = reservedSlots - usedSlots;
-            if (unusedSlots > 0)
+            finally
             {
-                try { _spaceSemaphore.Release(unusedSlots); } catch (ObjectDisposedException) { }
+                int unusedSlots = slotsToReserve - usedSlots;
+                if (unusedSlots > 0)
+                {
+                    try { _spaceSemaphore.Release(unusedSlots); } catch (ObjectDisposedException) { }
+                }
             }
         }
 
@@ -536,96 +552,109 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         var mss = _mss;
         int originalBufferLength = buffer.Length;
 
-        // In stream mode, the tail slot may already have free bytes; avoid reserving
-        // slots we will immediately release.  Snapshot under lock is not possible here
-        // (we haven't acquired _syncRoot yet), so we use an optimistic estimate:
-        // assume worst case (no tail space) then release excess in the finally block.
-        // For non-stream mode, every byte must occupy its own slot up to mss.
-        int reservedSlots;
-        if (_stream)
-        {
-            // Stream: 0 new slots needed if buffer fits entirely in the tail;
-            // otherwise ceil(remaining / mss).  We over-reserve by at most 1 slot.
-            reservedSlots = originalBufferLength <= mss ? 1 : (originalBufferLength + mss - 1) / mss;
-        }
-        else
-        {
-            reservedSlots = originalBufferLength <= mss ? 1 : (originalBufferLength + mss - 1) / mss;
-            if (reservedSlots > 256)
-                throw new ArgumentException("Message is too large (requires > 256 fragments).", nameof(buffer));
-        }
-
-        try
-        {
-            await _spaceSemaphore.WaitAsync(reservedSlots, cancellationToken).ConfigureAwait(false);
-        }
-        catch (ObjectDisposedException)
-        {
-            throw new InvalidOperationException("Transport closed.");
-        }
-
-        if (_transportClosed || _disposed)
-        {
-            try { _spaceSemaphore.Release(reservedSlots); } catch (ObjectDisposedException) { }
-            throw new InvalidOperationException("Transport closed.");
-        }
-
-        int usedSlots = 0;
         bool anySegmentAdded = false;
 
-        try
+        if (!_stream && originalBufferLength > 256 * mss)
         {
-            lock (_syncRoot)
-            {
-                if (_transportClosed || _disposed)
-                {
-                    // The finally block handles semaphore release
-                    throw new InvalidOperationException("Transport closed.");
-                }
+            throw new ArgumentException("Message is too large (requires > 256 fragments).", nameof(buffer));
+        }
 
-                if (_stream && _queueCount > 0)
+        while (buffer.Length > 0)
+        {
+            int slotsToReserve = 0;
+            if (_stream)
+            {
+                lock (_syncRoot)
                 {
-                    int lastIndex = (_queueTail - 1 + _queueArray.Length) % _queueArray.Length;
-                    ref var dataRef = ref _queueArray[lastIndex].Data;
-                    var expand = mss - dataRef.Length;
-                    expand = Math.Min(expand, buffer.Length);
-                    if (expand > 0)
+                    if (_transportClosed || _disposed) throw new InvalidOperationException("Transport closed.");
+                    if (_queueCount > 0)
                     {
-                        dataRef = dataRef.AppendData(buffer.Span.Slice(0, expand));
-                        buffer = buffer.Slice(expand);
-                        Interlocked.Add(ref _unflushedBytes, expand);
+                        int lastIndex = (_queueTail - 1 + _queueArray.Length) % _queueArray.Length;
+                        ref var dataRef = ref _queueArray[lastIndex].Data;
+                        var expand = mss - dataRef.Length;
+                        expand = Math.Min(expand, buffer.Length);
+                        if (expand > 0)
+                        {
+                            dataRef = dataRef.AppendData(buffer.Span.Slice(0, expand));
+                            buffer = buffer.Slice(expand);
+                            Interlocked.Add(ref _unflushedBytes, expand);
+                            anySegmentAdded = true;
+                        }
+                    }
+                }
+            }
+
+            if (buffer.Length == 0) break;
+
+            int fragmentsNeeded = buffer.Length <= mss ? 1 : (buffer.Length + mss - 1) / mss;
+            slotsToReserve = fragmentsNeeded;
+
+            try
+            {
+                await _spaceSemaphore.WaitAsync(slotsToReserve, cancellationToken).ConfigureAwait(false);
+            }
+            catch (ObjectDisposedException)
+            {
+                throw new InvalidOperationException("Transport closed.");
+            }
+
+            if (_transportClosed || _disposed)
+            {
+                try { _spaceSemaphore.Release(slotsToReserve); } catch (ObjectDisposedException) { }
+                throw new InvalidOperationException("Transport closed.");
+            }
+
+            int usedSlots = 0;
+            try
+            {
+                lock (_syncRoot)
+                {
+                    if (_transportClosed || _disposed)
+                    {
+                        throw new InvalidOperationException("Transport closed.");
+                    }
+
+                    if (_stream && _queueCount > 0)
+                    {
+                        int lastIndex = (_queueTail - 1 + _queueArray.Length) % _queueArray.Length;
+                        ref var dataRef = ref _queueArray[lastIndex].Data;
+                        var expand = mss - dataRef.Length;
+                        expand = Math.Min(expand, buffer.Length);
+                        if (expand > 0)
+                        {
+                            dataRef = dataRef.AppendData(buffer.Span.Slice(0, expand));
+                            buffer = buffer.Slice(expand);
+                            Interlocked.Add(ref _unflushedBytes, expand);
+                            anySegmentAdded = true;
+                        }
+                    }
+
+                    int currentFragmentIndex = buffer.Length <= mss ? 0 : (buffer.Length + mss - 1) / mss - 1;
+
+                    while (buffer.Length > 0 && usedSlots < slotsToReserve)
+                    {
+                        int size = buffer.Length > mss ? mss : buffer.Length;
+                        var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
+                        var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Span.Slice(0, size));
+                        buffer = buffer.Slice(size);
+
+                        _queueArray[_queueTail] = (kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex);
+                        _queueTail = (_queueTail + 1) % _queueArray.Length;
+                        _queueCount++;
+                        Interlocked.Add(ref _unflushedBytes, size);
+                        usedSlots++;
+                        currentFragmentIndex--;
                         anySegmentAdded = true;
                     }
                 }
-
-                int fragmentsNeeded = buffer.Length <= mss ? 1 : (buffer.Length + mss - 1) / mss;
-                int remainingFragments = fragmentsNeeded;
-                int currentFragmentIndex = fragmentsNeeded - 1; // Count down for fragments
-
-                while (remainingFragments > 0)
-                {
-                    int size = buffer.Length > mss ? mss : buffer.Length;
-                    var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
-                    var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Span.Slice(0, size));
-                    buffer = buffer.Slice(size);
-
-                    _queueArray[_queueTail] = (kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex);
-                    _queueTail = (_queueTail + 1) % _queueArray.Length;
-                    _queueCount++;
-                    Interlocked.Add(ref _unflushedBytes, size);
-                    usedSlots++;
-                    currentFragmentIndex--;
-                    remainingFragments--;
-                    anySegmentAdded = true;
-                }
             }
-        }
-        finally
-        {
-            int unusedSlots = reservedSlots - usedSlots;
-            if (unusedSlots > 0)
+            finally
             {
-                try { _spaceSemaphore.Release(unusedSlots); } catch (ObjectDisposedException) { }
+                int unusedSlots = slotsToReserve - usedSlots;
+                if (unusedSlots > 0)
+                {
+                    try { _spaceSemaphore.Release(unusedSlots); } catch (ObjectDisposedException) { }
+                }
             }
         }
 

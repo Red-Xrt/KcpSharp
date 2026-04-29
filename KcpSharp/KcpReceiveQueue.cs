@@ -55,7 +55,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         _stream = stream;
 
         int pow2Capacity = 16;
-        while (pow2Capacity <= capacity) pow2Capacity *= 2;
+        while (pow2Capacity < capacity) pow2Capacity *= 2;
         _slots = new ReceiveQueueSlot[pow2Capacity];
 
         _mrvtsc = new ManualResetValueTaskSourceCore<KcpConversationReceiveResult>();

@@ -13,11 +13,11 @@ internal static class KcpGlobalTickEngine
         public volatile int _unregisteredRef;
         public bool Unregistered => _unregisteredRef != 0;
 
-        public Entry(KcpConversationUpdateActivation activation, int interval, uint currentTick)
+        public Entry(KcpConversationUpdateActivation activation, int interval, uint nextTick)
         {
             Activation = activation;
             Interval = interval;
-            NextTick = currentTick + (uint)interval;
+            NextTick = nextTick;
         }
     }
 
@@ -82,8 +82,7 @@ internal static class KcpGlobalTickEngine
         var currentTick = (uint)Environment.TickCount;
         // Jitter: random offset to spread out concurrent registrations
         var jitter = (uint)(Random.Shared.Next(0, interval));
-        var entry = new Entry(activation, interval, currentTick - (uint)interval + jitter);
-        entry.NextTick = currentTick + jitter;
+        var entry = new Entry(activation, interval, currentTick + jitter);
 
         if (s_activations.TryAdd(activation, entry))
         {
@@ -249,33 +248,6 @@ internal static class KcpGlobalTickEngine
                 // to prevent accumulating lag on the next loop iteration.
                 if (diffMs / SlotMs > WheelSlots)
                 {
-                    // Clear all slots first to prevent duplicates
-                    for (int i = 0; i < WheelSlots; i++)
-                    {
-                        lock (s_wheelLocks[i])
-                        {
-                            s_wheel[i].Clear();
-                        }
-                    }
-
-                    // Emergency: stagger notifications to prevent O(N) storm
-                    int staggerIndex = 0;
-                    foreach (var kvp in s_activations)
-                    {
-                        var entry = kvp.Value;
-                        if (!entry.Unregistered)
-                        {
-                            uint staggeredTick = currentTickMs + (uint)(staggerIndex % WheelSlots) * SlotMs;
-                            entry.NextTick = staggeredTick;
-                            int nextSlot = GetSlot(staggeredTick);
-                            entry.CurrentWheelSlot = nextSlot;
-                            lock (s_wheelLocks[nextSlot])
-                            {
-                                s_wheel[nextSlot].Add(kvp.Key);
-                            }
-                            staggerIndex++;
-                        }
-                    }
                     s_lastTickMs = currentTickMs - (currentTickMs % SlotMs);
                 }
             }
