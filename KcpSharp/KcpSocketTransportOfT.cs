@@ -60,7 +60,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     private bool _disposed;
 
     private readonly Memory<byte>[][] _batchBuffers;
-    private byte[]? _batchBufferSlab;
+    private unsafe void* _batchBufferSlab;
+    private UnmanagedMemoryManager? _batchBufferManager;
     private readonly IPEndPoint?[][] _batchEndpoints;
     private readonly int[][] _batchSizes;
     private readonly byte[][][] _batchAddresses;
@@ -72,9 +73,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     private readonly System.Threading.Lock _batchLock = new();
     private readonly SemaphoreSlim _flushSemaphore = new(1, 1);
 
-    private static readonly ObjectPool<KcpPacketOwner> s_sharedPacketOwnerPool = new DefaultObjectPool<KcpPacketOwner>(
-            new DefaultPooledObjectPolicy<KcpPacketOwner>(),
-            maximumRetained: Math.Max(4096, Environment.ProcessorCount * 128));
+
 
     /// <summary>
     ///     Construct a socket transport with the specified socket and remote endpoint.
@@ -102,7 +101,11 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
         if (maxBatchSize > 0)
         {
-            _batchBufferSlab = GC.AllocateUninitializedArray<byte>(2 * maxBatchSize * _mtu, pinned: true);
+            unsafe
+            {
+                _batchBufferSlab = System.Runtime.InteropServices.NativeMemory.Alloc((nuint)(2 * maxBatchSize * _mtu));
+                _batchBufferManager = new UnmanagedMemoryManager(_batchBufferSlab, 2 * maxBatchSize * _mtu);
+            }
             int slabOffset = 0;
 
             for (int s = 0; s < 2; s++)
@@ -111,7 +114,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                 _batchAddresses[s] = new byte[maxBatchSize][];
                 for (int i = 0; i < maxBatchSize; i++)
                 {
-                    _batchBuffers[s][i] = new Memory<byte>(_batchBufferSlab, slabOffset, _mtu);
+                    _batchBuffers[s][i] = _batchBufferManager.Memory.Slice(slabOffset, _mtu);
                     slabOffset += _mtu;
                     _batchAddresses[s][i] = new byte[128]; // Max SocketAddress size
                 }
@@ -629,8 +632,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         var connection = _connection;
         if (connection != null && connection is IKcpPacketSink sink)
         {
-            var owner = s_sharedPacketOwnerPool.Get();
-            owner.Initialize(s_sharedPacketOwnerPool, bytesReceived);
+            var owner = KcpPacketOwner.SharedPool.Get();
+            owner.Initialize(KcpPacketOwner.SharedPool, bytesReceived);
             packetMemory.Span.CopyTo(owner.Memory.Span);
             FireAndForgetInput(sink.InputPacketAsync(owner.Memory.Slice(0, bytesReceived), ep, owner, default));
         }
@@ -830,8 +833,8 @@ private async Task RunReceiveLoopLinuxAsync()
 
                             if (connection is IKcpPacketSink sink)
                             {
-                                var packetOwner = s_sharedPacketOwnerPool.Get();
-                                packetOwner.Initialize(s_sharedPacketOwnerPool, (int)bytesReceived);
+                                var packetOwner = KcpPacketOwner.SharedPool.Get();
+                                packetOwner.Initialize(KcpPacketOwner.SharedPool, (int)bytesReceived);
                                 packet.CopyTo(packetOwner.Memory.Slice(0, (int)bytesReceived));
 
                                 var inputTask = sink.InputPacketAsync(packetOwner.Memory.Slice(0, (int)bytesReceived), endpoint, packetOwner, cancellationToken);
@@ -908,6 +911,15 @@ private async Task RunReceiveLoopLinuxAsync()
     {
         if (!_disposed)
         {
+            unsafe
+            {
+                if (_batchBufferSlab != null)
+                {
+                    System.Runtime.InteropServices.NativeMemory.Free(_batchBufferSlab);
+                    _batchBufferSlab = null;
+                }
+            }
+
             if (disposing)
             {
                 var cts = Interlocked.Exchange(ref _cts, null);
@@ -934,4 +946,27 @@ private async Task RunReceiveLoopLinuxAsync()
     {
         Dispose(false);
     }
+}
+
+internal sealed unsafe class UnmanagedMemoryManager : System.Buffers.MemoryManager<byte>
+{
+    private void* _pointer;
+    private int _length;
+
+    public UnmanagedMemoryManager(void* pointer, int length)
+    {
+        _pointer = pointer;
+        _length = length;
+    }
+
+    public override Span<byte> GetSpan() => new Span<byte>(_pointer, _length);
+
+    public override System.Buffers.MemoryHandle Pin(int elementIndex = 0)
+    {
+        return new System.Buffers.MemoryHandle((byte*)_pointer + elementIndex);
+    }
+
+    public override void Unpin() { }
+
+    protected override void Dispose(bool disposing) { }
 }

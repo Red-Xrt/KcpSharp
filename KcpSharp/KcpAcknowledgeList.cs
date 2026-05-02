@@ -66,8 +66,7 @@ internal sealed class KcpAcknowledgeList
                 // Slot is ready to be consumed
                 if (Interlocked.CompareExchange(ref _dequeuePos, currentDequeuePos + 1, currentDequeuePos) == currentDequeuePos)
                 {
-                    // Ensure sequence check read is not reordered with SN/TS reads on weak memory models like ARM
-                    System.Threading.Thread.MemoryBarrier();
+                    // Volatile CAS provides sufficient barrier
                     destination[readCount] = (_ring[index].SN, _ring[index].TS);
                     readCount++;
 
