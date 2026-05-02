@@ -25,7 +25,7 @@ internal static class KcpGlobalTickEngine
 
     // Timing wheel based on 10ms slots
     private const int SlotMs = 10;
-    private const int WheelSlots = 256; // Must be power of 2 for fast modulo
+    private const int WheelSlots = 1024; // Must be power of 2 for fast modulo
     private const int WheelMask = WheelSlots - 1;
 
     // Each slot holds a HashSet of entries
@@ -222,7 +222,10 @@ internal static class KcpGlobalTickEngine
                                 if (TimeDiff(currentTickMs, entry.NextTick) >= 0)
                                 {
                                     entry.NextTick = (uint)(currentTickMs + entry.Interval);
-                                    activation.Notify();
+                                    if (!entry.Unregistered)
+                                    {
+                                        activation.Notify();
+                                    }
                                 }
 
                                 if (!entry.Unregistered)

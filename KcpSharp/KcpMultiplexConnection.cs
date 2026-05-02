@@ -151,7 +151,7 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
         {
             if (previousState == DisposingAsync || previousState == DisposingSync)
             {
-                activeTcs.Task.GetAwaiter().GetResult();
+                throw new InvalidOperationException("DisposeAsync is already in progress. Await DisposeAsync() instead of calling Dispose().");
             }
             return;
         }

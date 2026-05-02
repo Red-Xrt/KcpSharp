@@ -90,7 +90,8 @@ internal struct KcpBuffer
         }
         else
         {
-            throw new ObjectDisposedException(nameof(KcpBuffer), "KcpBuffer.Release() called on already-released buffer");
+            // Silently ignore to avoid double-release exceptions when KcpBuffer struct is copied
+            System.Diagnostics.Debug.Assert(false, "KcpBuffer.Release() called on already-released buffer");
         }
     }
 

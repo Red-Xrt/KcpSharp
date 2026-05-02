@@ -392,8 +392,10 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
                     var size = buffer.Length > mss ? mss : buffer.Length;
 
-                    var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
-                    var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Slice(0, size));
+                    var owner = KcpPacketOwner.SharedPool.Get();
+                    owner.Initialize(KcpPacketOwner.SharedPool, mss);
+                    buffer.Slice(0, size).CopyTo(owner.Memory.Span);
+                    var kcpBuffer = KcpBuffer.FromRetainedOwner(owner, owner.Memory, size);
                     buffer = buffer.Slice(size);
 
                     _queueArray[_queueTail] = (kcpBuffer, _stream ? (byte)0 : (byte)fragment);
@@ -464,7 +466,31 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
             if (buffer.Length == 0) break;
 
-            int fragmentsNeeded = buffer.Length <= mss ? 1 : (buffer.Length + mss - 1) / mss;
+            int fragmentsNeeded = 1;
+            if (buffer.Length <= mss)
+            {
+                fragmentsNeeded = 1;
+            }
+            else
+            {
+                int bufferLengthToReserve = buffer.Length;
+                if (_stream)
+                {
+                    lock (_syncRoot)
+                    {
+                        if (!_transportClosed && !_disposed && _queueCount > 0)
+                        {
+                            int lastIndex = (_queueTail - 1 + _queueArray.Length) % _queueArray.Length;
+                            int lastLength = _queueArray[lastIndex].Data.Length;
+                            int tailExpand = Math.Max(0, mss - lastLength);
+                            bufferLengthToReserve = Math.Max(0, buffer.Length - tailExpand);
+                        }
+                    }
+                }
+                fragmentsNeeded = bufferLengthToReserve <= 0 ? 0 : (bufferLengthToReserve <= mss ? 1 : (bufferLengthToReserve + mss - 1) / mss);
+            }
+            if (fragmentsNeeded <= 0) fragmentsNeeded = 1; // Always reserve at least 1 if we're looping and have buffer data
+
             // Reserve exactly what we need, or wait for at least 1 slot if we're looping.
             slotsToReserve = fragmentsNeeded;
 
@@ -514,8 +540,10 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     while (buffer.Length > 0 && usedSlots < slotsToReserve)
                     {
                         int size = buffer.Length > mss ? mss : buffer.Length;
-                        var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
-                        var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Span.Slice(0, size));
+                        var owner = KcpPacketOwner.SharedPool.Get();
+                        owner.Initialize(KcpPacketOwner.SharedPool, mss);
+                        buffer.Slice(0, size).Span.CopyTo(owner.Memory.Span);
+                        var kcpBuffer = KcpBuffer.FromRetainedOwner(owner, owner.Memory, size);
                         buffer = buffer.Slice(size);
 
                         _queueArray[_queueTail] = (kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex);
@@ -586,7 +614,31 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
             if (buffer.Length == 0) break;
 
-            int fragmentsNeeded = buffer.Length <= mss ? 1 : (buffer.Length + mss - 1) / mss;
+            int fragmentsNeeded = 1;
+            if (buffer.Length <= mss)
+            {
+                fragmentsNeeded = 1;
+            }
+            else
+            {
+                int bufferLengthToReserve = buffer.Length;
+                if (_stream)
+                {
+                    lock (_syncRoot)
+                    {
+                        if (!_transportClosed && !_disposed && _queueCount > 0)
+                        {
+                            int lastIndex = (_queueTail - 1 + _queueArray.Length) % _queueArray.Length;
+                            int lastLength = _queueArray[lastIndex].Data.Length;
+                            int tailExpand = Math.Max(0, mss - lastLength);
+                            bufferLengthToReserve = Math.Max(0, buffer.Length - tailExpand);
+                        }
+                    }
+                }
+                fragmentsNeeded = bufferLengthToReserve <= 0 ? 0 : (bufferLengthToReserve <= mss ? 1 : (bufferLengthToReserve + mss - 1) / mss);
+            }
+            if (fragmentsNeeded <= 0) fragmentsNeeded = 1; // Always reserve at least 1 if we're looping and have buffer data
+
             slotsToReserve = fragmentsNeeded;
 
             try
@@ -634,8 +686,10 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     while (buffer.Length > 0 && usedSlots < slotsToReserve)
                     {
                         int size = buffer.Length > mss ? mss : buffer.Length;
-                        var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(mss, false));
-                        var kcpBuffer = KcpBuffer.CreateFromSpan(owner, buffer.Span.Slice(0, size));
+                        var owner = KcpPacketOwner.SharedPool.Get();
+                        owner.Initialize(KcpPacketOwner.SharedPool, mss);
+                        buffer.Slice(0, size).Span.CopyTo(owner.Memory.Span);
+                        var kcpBuffer = KcpBuffer.FromRetainedOwner(owner, owner.Memory, size);
                         buffer = buffer.Slice(size);
 
                         _queueArray[_queueTail] = (kcpBuffer, _stream ? (byte)0 : (byte)currentFragmentIndex);

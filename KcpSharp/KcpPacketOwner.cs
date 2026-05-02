@@ -6,6 +6,9 @@ namespace KcpSharp;
 internal class KcpPacketOwner : System.Buffers.IMemoryOwner<byte>, IRefCountedBuffer
 {
     private byte[]? _array;
+    public static readonly ObjectPool<KcpPacketOwner> SharedPool = new DefaultObjectPool<KcpPacketOwner>(
+        new DefaultPooledObjectPolicy<KcpPacketOwner>(),
+        maximumRetained: Math.Max(4096, Environment.ProcessorCount * 128));
     private ObjectPool<KcpPacketOwner>? _pool;
     private int _refCount;
 

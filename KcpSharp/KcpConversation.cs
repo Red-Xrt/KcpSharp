@@ -12,8 +12,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 {
     private readonly System.Threading.Lock _sndBufLock = new();
     private readonly System.Threading.Lock _rtoLock = new();
-    private readonly SemaphoreSlim _flushSemaphore = new(1, 1);
-    private readonly KcpPacketHeader[] _cachedBatchHeaders;
+        private readonly KcpPacketHeader[] _cachedBatchHeaders;
     private readonly KcpBuffer[] _cachedBatchData;
     private readonly System.Threading.Lock _rcvBufLock = new();
 
@@ -200,10 +199,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         _nocwnd = options is not null && options.DisableCongestionControl;
         StreamMode = options is not null && options.StreamMode;
 
-        // Note: The dequeue buffer size is intentionally capped at 256. If _snd_wnd is configured > 256,
-        // each flush cycle will dequeue and encode a maximum of 256 segments per iteration.
-        // This is safe because KCP fragmentation only supports 256 fragments, but large windows may see chunked throughput.
-        _flushDequeueBuffer = new (KcpBuffer, byte)[Math.Min((int)_snd_wnd, 256)];
+        // The dequeue buffer is sized to the full send window to avoid capping throughput for large windows.
+        _flushDequeueBuffer = new (KcpBuffer, byte)[_snd_wnd];
 
         int sndBufCapacity = 16;
         while (sndBufCapacity < _snd_wnd)
@@ -563,7 +560,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         if (snapshotLimit < _ackList.Count)
         {
-            KcpMetrics.AckSnapshotPartial.Add(1);
+            KcpMetrics.AckSnapshotPartial.Add(1, new System.Collections.Generic.KeyValuePair<string, object?>("conversation_id", _id));
         }
 
         // Check if we need to resize the cached array
@@ -646,7 +643,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     [AsyncMethodBuilder(typeof(KcpFlushAsyncMethodBuilder))]
     private async ValueTask FlushCore2Async(bool ackPushed, CancellationToken cancellationToken)
     {
-        await _flushSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             if (TransportClosed) return;
@@ -892,8 +888,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
                                 var header = DuplicateHeader(ref item.Segment, current, windowSize, unacknowledged);
 
-                                if (incrementRetransmission) KcpMetrics.RetransmissionCount.Add(1);
-                                if (incrementFastRetransmission) KcpMetrics.FastRetransmissionCount.Add(1);
+                                if (incrementRetransmission) KcpMetrics.RetransmissionCount.Add(1, new System.Collections.Generic.KeyValuePair<string, object?>("conversation_id", _id));
+                                if (incrementFastRetransmission) KcpMetrics.FastRetransmissionCount.Add(1, new System.Collections.Generic.KeyValuePair<string, object?>("conversation_id", _id));
 
                                 // Snapshot for out-of-lock encoding
                                 batchHeaders[batchCount] = header;
@@ -1183,17 +1179,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         catch (Exception ex)
         {
             HandleFlushException(ex);
-        }
-        finally
-        {
-            try
-            {
-                _flushSemaphore.Release();
-            }
-            catch (ObjectDisposedException)
-            {
-                // Ignore ObjectDisposedException
-            }
         }
     }
 
@@ -1487,6 +1472,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             ? KcpGlobalVars.HEADER_LENGTH_WITH_CONVID
             : KcpGlobalVars.HEADER_LENGTH_WITHOUT_CONVID;
 
+        uint prev_una;
+        lock (_sndBufLock)
+        {
+            prev_una = _snd_una;
+        }
+
         uint maxack = 0, latest_ts = 0;
         var flag = false;
         var mutated = false;
@@ -1599,6 +1590,38 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             if (mutated)
             {
                 mutated = UpdateSendUnacknowledged() | mutated;
+            }
+
+            if (TimeDiff(_snd_una, prev_una) > 0)
+            {
+                var cwnd = _cwnd;
+                var incr = _incr;
+
+                var rmt_wnd = Volatile.Read(ref _rmt_wnd);
+                if (cwnd < rmt_wnd)
+                {
+                    var mss = (uint)_mss;
+                    if (cwnd < _ssthresh)
+                    {
+                        cwnd++;
+                        incr += mss;
+                    }
+                    else
+                    {
+                        if (incr < mss) incr = mss;
+                        incr += (uint)mss * (uint)mss / Math.Max(1u, incr) + (uint)(mss / 16);
+                        cwnd = (incr + mss - 1) / (mss > 0 ? mss : 1);
+                    }
+
+                    if (cwnd > rmt_wnd)
+                    {
+                        cwnd = rmt_wnd;
+                        incr = rmt_wnd * mss;
+                    }
+                }
+
+                _cwnd = cwnd;
+                _incr = incr;
             }
 
             return mutated;
@@ -1879,7 +1902,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     /// </summary>
     private void UpdateRto(int rtt)
     {
-        KcpMetrics.RoundTripTime.Record(rtt);
+        KcpMetrics.RoundTripTime.Record(rtt, new System.Collections.Generic.KeyValuePair<string, object?>("conversation_id", _id));
         lock (_rtoLock)
         {
             UpdateRtoCore(rtt);
@@ -2252,12 +2275,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
     /// <summary>
     ///     Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
-    ///     <para>
-    ///     Warning: Background buffer teardown is asynchronous and not guaranteed to be complete upon return.
-    ///     In tests or fast-restart scenarios where flush buffers might be reused immediately, use <see cref="DisposeAsync"/> instead.
-    ///     </para>
     /// </summary>
-    [Obsolete("Warning: Background buffer teardown is asynchronous and not guaranteed to be complete upon return. In scenarios with high churn, use DisposeAsync() instead.")]
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
@@ -2266,8 +2284,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         try { _sendQueue.Dispose(); } catch { }
         try { _receiveQueue.Dispose(); } catch { }
 
-        // We explicitly do not await background tasks here to avoid thread-pool starvation.
-        // The [Obsolete] attribute warns callers to use DisposeAsync() for safe teardown.
+                try { _cachedFlushBuffer.Dispose(); } catch { }
+        try { _cachedAckFlushBuffer.Dispose(); } catch { }
     }
 
     public async ValueTask DisposeAsync()
@@ -2294,8 +2312,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
         catch { }
 
-        try { _flushSemaphore.Dispose(); } catch { }
-        try { _cachedFlushBuffer.Dispose(); } catch { }
+                try { _cachedFlushBuffer.Dispose(); } catch { }
         try { _cachedAckFlushBuffer.Dispose(); } catch { }
     }
 }
