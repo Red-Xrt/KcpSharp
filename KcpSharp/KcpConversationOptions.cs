@@ -223,7 +223,7 @@ public class KcpConversationOptions
         if (UpdateInterval < 0)
             throw new ArgumentException("UpdateInterval must be a positive integer.", nameof(UpdateInterval));
         if (FastResend < 0)
-            throw new ArgumentException("FastResend must be a positive integer.", nameof(FastResend));
+            throw new ArgumentException("FastResend must be a non-negative integer.", nameof(FastResend));
         if (SendWindow < 0)
             throw new ArgumentException("SendWindow must be non-negative.", nameof(SendWindow));
         if (ReceiveWindow < 0)

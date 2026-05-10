@@ -778,7 +778,10 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             try
             {
                 long flushStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-                long flushBudgetTicks = TimeSpan.FromMilliseconds(2).Ticks; // 2ms budget before yielding
+                // Stopwatch.Frequency is ticks-per-second; convert 2 ms to Stopwatch ticks.
+                // TimeSpan.Ticks uses 100-ns units (10 000 000 ticks/s) which differs from
+                // Stopwatch.Frequency on most platforms, making the raw Ticks value incorrect here.
+                long flushBudgetTicks = System.Diagnostics.Stopwatch.Frequency * 2 / 1000; // 2ms budget before yielding
 
                 current = GetTimestamp(); // Refresh before data segment flush loop
 
@@ -1253,7 +1256,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             var current = GetTimestamp();
 
             long drainStartTicks = System.Diagnostics.Stopwatch.GetTimestamp();
-            long drainBudgetTicks = TimeSpan.FromMilliseconds(2).Ticks;
+            // Use Stopwatch.Frequency-based budget (not TimeSpan.Ticks) to match GetTimestamp() units.
+            long drainBudgetTicks = System.Diagnostics.Stopwatch.Frequency * 2 / 1000; // 2ms
 
             while (true)
             {

@@ -23,6 +23,7 @@ internal sealed class KcpRawChannel : IKcpConversation, IKcpExceptionProducer<Kc
     private object? _exceptionHandlerState;
 
     private CancellationTokenSource? _sendLoopCts;
+    private Task _sendLoopTask = Task.CompletedTask;
 
     /// <summary>
     ///     Construct an unreliable channel with no conversation ID.
@@ -80,7 +81,7 @@ internal sealed class KcpRawChannel : IKcpConversation, IKcpExceptionProducer<Kc
         _receiveQueue = new KcpRawReceiveQueue(_bufferPool, queueSize);
         _sendOperation = new KcpRawSendOperation(_sendNotification);
 
-        RunSendLoop();
+        _sendLoopTask = RunSendLoopAsync();
     }
 
     /// <summary>
@@ -137,8 +138,10 @@ internal sealed class KcpRawChannel : IKcpConversation, IKcpExceptionProducer<Kc
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
-        Dispose();
-        await System.Threading.Tasks.Task.CompletedTask;
+        SetTransportClosed();
+        try { await _sendLoopTask.ConfigureAwait(false); } catch { }
+        _receiveQueue.Dispose();
+        _sendOperation.Dispose();
     }
 
     public void Dispose()
@@ -174,7 +177,7 @@ internal sealed class KcpRawChannel : IKcpConversation, IKcpExceptionProducer<Kc
     ///     is completed.
     /// </exception>
     /// <exception cref="InvalidOperationException">The send operation is initiated concurrently.</exception>
-    /// <exception cref="ObjectDisposedException">The <see cref="KcpConversation" /> instance is disposed.</exception>
+    /// <exception cref="ObjectDisposedException">The <see cref="KcpRawChannel" /> instance is disposed.</exception>
     /// <returns>
     ///     A <see cref="ValueTask{Boolean}" /> that completes when the entire message is put into the queue. The result
     ///     of the task is false when the transport is closed.
@@ -217,7 +220,7 @@ internal sealed class KcpRawChannel : IKcpConversation, IKcpExceptionProducer<Kc
     }
 
 
-    private async void RunSendLoop()
+    private async Task RunSendLoopAsync()
     {
         var cancellationToken = _sendLoopCts?.Token ?? new CancellationToken(true);
         var sendOperation = _sendOperation;

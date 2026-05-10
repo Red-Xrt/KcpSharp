@@ -10,18 +10,18 @@ namespace KcpSharp;
 internal static class KcpSocketTransportNative
 {
     [StructLayout(LayoutKind.Sequential)]
-    internal unsafe struct iovec
+    internal unsafe struct Iovec
     {
         public void* iov_base;
         public nuint iov_len;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal unsafe struct msghdr
+    internal unsafe struct Msghdr
     {
         public void* msg_name;
         public uint msg_namelen;
-        public iovec* msg_iov;
+        public Iovec* msg_iov;
         public nuint msg_iovlen;
         public void* msg_control;
         public nuint msg_controllen;
@@ -30,19 +30,19 @@ internal static class KcpSocketTransportNative
 
     // Stack Buffer Overflow Fix: Separate msghdr and msg_len and handle alignment properly for 64-bit systems.
     [StructLayout(LayoutKind.Sequential)]
-    internal unsafe struct mmsghdr
+    internal unsafe struct Mmsghdr
     {
-        public msghdr msg_hdr;
+        public Msghdr msg_hdr;
         public uint msg_len;
         // The CLR will automatically pad this to the largest member alignment, but Linux ABI demands 8-byte alignment
         // if msghdr is 8-byte aligned. On 64-bit systems, msghdr will be aligned to 8 bytes, so mmsghdr will be as well.
     }
 
     [DllImport("libc", EntryPoint = "sendmmsg", SetLastError = true)]
-    internal static extern unsafe int sendmmsg(int sockfd, mmsghdr* msgvec, uint vlen, int flags);
+    internal static extern unsafe int sendmmsg(int sockfd, Mmsghdr* msgvec, uint vlen, int flags);
 
     [DllImport("libc", EntryPoint = "recvmmsg", SetLastError = true)]
-    internal static extern unsafe int recvmmsg(int sockfd, mmsghdr* msgvec, uint vlen, int flags, void* timeout);
+    internal static extern unsafe int recvmmsg(int sockfd, Mmsghdr* msgvec, uint vlen, int flags, void* timeout);
 }
 
 /// <summary>
@@ -130,7 +130,7 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     }
 
     /// <summary>
-    ///     Get the upper-level connection instace. If Start is not called or the transport is closed,
+    ///     Get the upper-level connection instance. If Start is not called or the transport is closed,
     ///     <see cref="InvalidOperationException" /> will be thrown.
     /// </summary>
     /// <exception cref="InvalidOperationException">Start is not called or the transport is closed.</exception>
@@ -231,23 +231,26 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
             {
                 unsafe
                 {
-                    KcpSocketTransportNative.mmsghdr[]? msgvecPool = null;
-                    KcpSocketTransportNative.iovec[]? iovecsPool = null;
-                    Span<KcpSocketTransportNative.mmsghdr> msgvec;
-                    Span<KcpSocketTransportNative.iovec> iovecs;
+                    KcpSocketTransportNative.Mmsghdr[]? msgvecPool = null;
+                    KcpSocketTransportNative.Iovec[]? iovecsPool = null;
+                    // CS9081: stackalloc spans are used only locally within fixed blocks below and never escape.
+#pragma warning disable CS9081
+                    Span<KcpSocketTransportNative.Mmsghdr> msgvec;
+                    Span<KcpSocketTransportNative.Iovec> iovecs;
 
                     if (countToFlush <= 32)
                     {
-                        msgvec = stackalloc KcpSocketTransportNative.mmsghdr[countToFlush];
-                        iovecs = stackalloc KcpSocketTransportNative.iovec[countToFlush];
+                        msgvec = stackalloc KcpSocketTransportNative.Mmsghdr[countToFlush];
+                        iovecs = stackalloc KcpSocketTransportNative.Iovec[countToFlush];
                     }
                     else
                     {
-                        msgvecPool = ArrayPool<KcpSocketTransportNative.mmsghdr>.Shared.Rent(countToFlush);
-                        iovecsPool = ArrayPool<KcpSocketTransportNative.iovec>.Shared.Rent(countToFlush);
+                        msgvecPool = ArrayPool<KcpSocketTransportNative.Mmsghdr>.Shared.Rent(countToFlush);
+                        iovecsPool = ArrayPool<KcpSocketTransportNative.Iovec>.Shared.Rent(countToFlush);
                         msgvec = msgvecPool.AsSpan(0, countToFlush);
                         iovecs = iovecsPool.AsSpan(0, countToFlush);
                     }
+#pragma warning restore CS9081
 
                     byte[] socketAddresses = ArrayPool<byte>.Shared.Rent(countToFlush * 128);
 
@@ -255,8 +258,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                     {
                         fixed (byte* pAddrStr = socketAddresses)
                         {
-                            fixed (KcpSocketTransportNative.iovec* pIovecs = iovecs)
-                            fixed (KcpSocketTransportNative.mmsghdr* msgvecPtr = msgvec)
+                        fixed (KcpSocketTransportNative.Iovec* pIovecs = iovecs)
+                        fixed (KcpSocketTransportNative.Mmsghdr* msgvecPtr = msgvec)
                             {
                                 for (int i = 0; i < countToFlush; i++)
                                 {
@@ -316,8 +319,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                     finally
                     {
                         ArrayPool<byte>.Shared.Return(socketAddresses);
-                        if (msgvecPool != null) ArrayPool<KcpSocketTransportNative.mmsghdr>.Shared.Return(msgvecPool);
-                        if (iovecsPool != null) ArrayPool<KcpSocketTransportNative.iovec>.Shared.Return(iovecsPool);
+                        if (msgvecPool != null) ArrayPool<KcpSocketTransportNative.Mmsghdr>.Shared.Return(msgvecPool);
+                        if (iovecsPool != null) ArrayPool<KcpSocketTransportNative.Iovec>.Shared.Return(iovecsPool);
                     }
                 }
             }
@@ -654,8 +657,8 @@ private async Task RunReceiveLoopLinuxAsync()
         // from the OS kernel buffer into managed memory to reduce recvmmsg syscalls and context switches.
         int maxBatchSize = _maxBatchSize > 0 ? _maxBatchSize : 32;
 
-        KcpSocketTransportNative.mmsghdr[] msgvecPool = ArrayPool<KcpSocketTransportNative.mmsghdr>.Shared.Rent(maxBatchSize);
-        KcpSocketTransportNative.iovec[] iovecsPool = ArrayPool<KcpSocketTransportNative.iovec>.Shared.Rent(maxBatchSize);
+        KcpSocketTransportNative.Mmsghdr[] msgvecPool = ArrayPool<KcpSocketTransportNative.Mmsghdr>.Shared.Rent(maxBatchSize);
+        KcpSocketTransportNative.Iovec[] iovecsPool = ArrayPool<KcpSocketTransportNative.Iovec>.Shared.Rent(maxBatchSize);
         byte[] addressBuffer = ArrayPool<byte>.Shared.Rent(maxBatchSize * 128);
         byte[] rxSlab = ArrayPool<byte>.Shared.Rent(maxBatchSize * 65536);
         Memory<byte>[] buffers = new Memory<byte>[maxBatchSize];
@@ -678,8 +681,8 @@ private async Task RunReceiveLoopLinuxAsync()
             unsafe
             {
                 fixed (byte* pAddrStr = addressBuffer)
-                fixed (KcpSocketTransportNative.iovec* pIovecs = iovecsPool)
-                fixed (KcpSocketTransportNative.mmsghdr* pMsgvec = msgvecPool)
+                fixed (KcpSocketTransportNative.Iovec* pIovecs = iovecsPool)
+                fixed (KcpSocketTransportNative.Mmsghdr* pMsgvec = msgvecPool)
                 {
                     for (int i = 0; i < maxBatchSize; i++)
                     {
@@ -737,8 +740,8 @@ private async Task RunReceiveLoopLinuxAsync()
                 unsafe
                 {
                     fixed (byte* pAddrStr = addressBuffer)
-                    fixed (KcpSocketTransportNative.iovec* pIovecs = iovecsPool)
-                    fixed (KcpSocketTransportNative.mmsghdr* pMsgvec = msgvecPool)
+                    fixed (KcpSocketTransportNative.Iovec* pIovecs = iovecsPool)
+                    fixed (KcpSocketTransportNative.Mmsghdr* pMsgvec = msgvecPool)
                     {
                         fixed (byte* pRxSlab = rxSlab)
                         {
@@ -865,8 +868,8 @@ private async Task RunReceiveLoopLinuxAsync()
         finally
         {
             ArrayPool<byte>.Shared.Return(addressBuffer);
-            ArrayPool<KcpSocketTransportNative.mmsghdr>.Shared.Return(msgvecPool);
-            ArrayPool<KcpSocketTransportNative.iovec>.Shared.Return(iovecsPool);
+            ArrayPool<KcpSocketTransportNative.Mmsghdr>.Shared.Return(msgvecPool);
+            ArrayPool<KcpSocketTransportNative.Iovec>.Shared.Return(iovecsPool);
             ArrayPool<byte>.Shared.Return(rxSlab);
         }
     }

@@ -110,6 +110,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
     void IValueTaskSource.GetResult(short token)
     {
+        _cancellationRegistration.Dispose();
         try
         {
             _mrvtsc.GetResult(token);

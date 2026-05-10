@@ -7,14 +7,14 @@ namespace KcpSharp;
 /// </summary>
 /// <remarks>
 ///     To consume these metrics, use the .NET `MeterListener` or `OpenTelemetry.Instrumentation.Runtime`
-///     and subscribe to the "HyacineCore.Server.Kcp" meter.
+///     and subscribe to the "KcpSharp" meter.
 /// </remarks>
 public static class KcpMetrics
 {
     /// <summary>
     ///     The meter used for KCP metrics.
     /// </summary>
-    public static readonly Meter Meter = new Meter("HyacineCore.Server.Kcp");
+    public static readonly Meter Meter = new Meter("KcpSharp");
 
     /// <summary>
     ///     The counter for the number of KCP segments retransmitted.

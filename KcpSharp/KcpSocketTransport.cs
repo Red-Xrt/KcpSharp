@@ -9,7 +9,7 @@ namespace KcpSharp;
 internal static class KcpSocketTransport
 {
     /// <summary>
-    ///     Create a socket transport for KCP covnersation.
+    ///     Create a socket transport for KCP conversation.
     /// </summary>
     /// <param name="socket">The udp socket instance.</param>
     /// <param name="endPoint">The remote endpoint.</param>
@@ -26,7 +26,7 @@ internal static class KcpSocketTransport
     }
 
     /// <summary>
-    ///     Create a socket transport for KCP covnersation with no conversation ID.
+    ///     Create a socket transport for KCP conversation with no conversation ID.
     /// </summary>
     /// <param name="socket">The udp socket instance.</param>
     /// <param name="endPoint">The remote endpoint.</param>

@@ -92,7 +92,11 @@ public sealed class KcpStream : Stream
                 if (_input.TryRead(out var readResult))
                 {
                     bool hasData = !readResult.Buffer.IsEmpty;
-                    _input.AdvanceTo(readResult.Buffer.Start, readResult.Buffer.End);
+                    // AdvanceTo(Start, Start): consumed=nothing, examined=nothing.
+                    // This preserves all data in the pipe so future reads can still see it.
+                    // Using examined=End would block the next TryRead until new data arrives,
+                    // causing a livelock even when existing data is present.
+                    _input.AdvanceTo(readResult.Buffer.Start, readResult.Buffer.Start);
                     return hasData;
                 }
                 return false;
@@ -287,7 +291,8 @@ public sealed class KcpStream : Stream
     {
         if (_conversation is not null)
         {
-            await _conversation.DisposeAsync().ConfigureAwait(false);
+            if (_ownsConversation)
+                await _conversation.DisposeAsync().ConfigureAwait(false);
             _conversation = null;
         }
 

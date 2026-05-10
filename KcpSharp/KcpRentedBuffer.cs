@@ -162,11 +162,14 @@ public readonly struct KcpRentedBuffer : IEquatable<KcpRentedBuffer>, IDisposabl
 
         if (Owner is null) return;
         if (Owner is ArrayPool<byte> arrayPool)
+        {
             if (MemoryMarshal.TryGetArray(_memory, out ArraySegment<byte> arraySegment))
-            {
                 arrayPool.Return(arraySegment.Array!);
-                return;
-            }
+            // If TryGetArray fails the backing array cannot be recovered via the pool reference.
+            // This should not happen in practice because KcpRentedBuffer always wraps array-backed
+            // Memory<byte> when the owner is an ArrayPool.
+            return;
+        }
 
         if (Owner is IDisposable disposable) disposable.Dispose();
     }

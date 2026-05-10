@@ -58,10 +58,10 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         while (pow2Capacity < capacity) pow2Capacity *= 2;
         _slots = new ReceiveQueueSlot[pow2Capacity];
 
-        _mrvtsc = new ManualResetValueTaskSourceCore<KcpConversationReceiveResult>();
-        _mrvtscInt = new ManualResetValueTaskSourceCore<int>();
-        _mrvtscBool = new ManualResetValueTaskSourceCore<bool>();
-        _mrvtscVoid = new ManualResetValueTaskSourceCore<bool>();
+        _mrvtsc = new ManualResetValueTaskSourceCore<KcpConversationReceiveResult> { RunContinuationsAsynchronously = true };
+        _mrvtscInt = new ManualResetValueTaskSourceCore<int> { RunContinuationsAsynchronously = true };
+        _mrvtscBool = new ManualResetValueTaskSourceCore<bool> { RunContinuationsAsynchronously = true };
+        _mrvtscVoid = new ManualResetValueTaskSourceCore<bool> { RunContinuationsAsynchronously = true };
     }
 
     public void Dispose()
@@ -495,6 +495,9 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         Exception? exceptionToSet = null;
         bool executeSetResult = false;
         KcpConversationReceiveResult resultToSet = default;
+        // Capture operationMode inside the lock so we can dispatch to the correct MRVTSC
+        // outside the lock without risking a race where a new waiter changes _operationMode.
+        int capturedOperationMode = 0;
         lock (_syncRoot)
         {
             if (_transportClosed || _disposed) return;
@@ -528,23 +531,26 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
                     TryCompleteReceive(ref executeSetException, ref exceptionToSet, ref executeSetResult, ref resultToSet);
                 }
                 TryCompleteWaitForData(ref executeSetResult, ref resultToSet);
+
+                // Snapshot operationMode under the lock so the dispatch below is race-free.
+                capturedOperationMode = _operationMode;
             }
         }
 
         if (executeSetException)
         {
-            if (_operationMode == 0 || _operationMode == 1 || _operationMode == 3)
+            if (capturedOperationMode == 0 || capturedOperationMode == 1 || capturedOperationMode == 3)
                 _mrvtsc.SetException(exceptionToSet!);
-            else if (_operationMode == 4)
+            else if (capturedOperationMode == 4)
                 _mrvtscInt.SetException(exceptionToSet!);
         }
         else if (executeSetResult)
         {
-            if (_operationMode == 0 || _operationMode == 1 || _operationMode == 3)
+            if (capturedOperationMode == 0 || capturedOperationMode == 1 || capturedOperationMode == 3)
                 _mrvtsc.SetResult(resultToSet);
-            else if (_operationMode == 2)
+            else if (capturedOperationMode == 2)
                 _mrvtscBool.SetResult(true);
-            else if (_operationMode == 4)
+            else if (capturedOperationMode == 4)
                 _mrvtscInt.SetResult(resultToSet.BytesReceived);
         }
     }
@@ -792,11 +798,13 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
     public void SetTransportClosed()
     {
         bool executeSetResult = false;
+        int capturedOperationMode = 0;
         lock (_syncRoot)
         {
             if (_transportClosed || _disposed) return;
             if (_activeWait && !_signaled)
             {
+                capturedOperationMode = _operationMode;
                 ClearPreviousOperation(true);
                 executeSetResult = true;
             }
@@ -817,11 +825,11 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
 
         if (executeSetResult)
         {
-            if (_operationMode == 0 || _operationMode == 1 || _operationMode == 3)
+            if (capturedOperationMode == 0 || capturedOperationMode == 1 || capturedOperationMode == 3)
                 _mrvtsc.SetResult(default);
-            else if (_operationMode == 2)
+            else if (capturedOperationMode == 2)
                 _mrvtscBool.SetResult(false);
-            else if (_operationMode == 4)
+            else if (capturedOperationMode == 4)
                 _mrvtscInt.SetResult(0);
         }
     }

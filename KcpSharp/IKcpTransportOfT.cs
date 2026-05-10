@@ -7,7 +7,7 @@
 internal interface IKcpTransport<out T> : IKcpTransport, IKcpExceptionProducer<IKcpTransport<T>>, IDisposable
 {
     /// <summary>
-    ///     Get the upper-level connection instace. If Start is not called or the transport is closed,
+    ///     Get the upper-level connection instance. If Start is not called or the transport is closed,
     ///     <see cref="InvalidOperationException" /> will be thrown.
     /// </summary>
     /// <exception cref="InvalidOperationException">Start is not called or the transport is closed.</exception>

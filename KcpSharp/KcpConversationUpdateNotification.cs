@@ -44,6 +44,9 @@ internal readonly struct KcpConversationUpdateNotification : IDisposable
 
     public void Dispose()
     {
-        if (_source is not null) _source.Release();
+        if (_source is not null)
+            _source.Release();
+        else
+            _directOwner?.Dispose();
     }
 }
