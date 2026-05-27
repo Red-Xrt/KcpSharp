@@ -22,6 +22,9 @@ internal class KcpPacketOwner : System.Buffers.IMemoryOwner<byte>, IRefCountedBu
 
     public void Initialize(ObjectPool<KcpPacketOwner> pool, int minimumLength)
     {
+        if (Volatile.Read(ref _refCount) != 0 || _array is not null)
+            throw new InvalidOperationException("KcpPacketOwner must be fully released before re-initialization.");
+
         _pool = pool;
         _array = ArrayPool<byte>.Shared.Rent(minimumLength);
         _refCount = 1;
@@ -40,7 +43,14 @@ internal class KcpPacketOwner : System.Buffers.IMemoryOwner<byte>, IRefCountedBu
 
     public void Dispose()
     {
-        if (Interlocked.Decrement(ref _refCount) == 0)
+        var newCount = Interlocked.Decrement(ref _refCount);
+        if (newCount < 0)
+        {
+            Interlocked.Increment(ref _refCount);
+            return;
+        }
+
+        if (newCount == 0)
         {
             var array = Interlocked.Exchange(ref _array, null);
             if (array != null)

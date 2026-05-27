@@ -932,8 +932,21 @@ private async Task RunReceiveLoopLinuxAsync()
                     cts.Dispose();
                 }
 
-                _connection?.Dispose();
-                _flushSemaphore.Dispose();
+                try
+                {
+                    if (_connection is IAsyncDisposable asyncDisposable)
+                        asyncDisposable.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                    else
+                        _connection?.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"Failed to dispose connection: {ex.Message}");
+                }
+                finally
+                {
+                    _flushSemaphore.Dispose();
+                }
             }
 
             _connection = null;

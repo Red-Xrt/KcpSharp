@@ -113,6 +113,12 @@ internal static class KcpGlobalTickEngine
 #pragma warning disable CS0420
             Volatile.Write(ref entry._unregisteredRef, 1);
 #pragma warning restore CS0420
+
+            int slot = entry.CurrentWheelSlot;
+            lock (s_wheelLocks[slot])
+            {
+                s_wheel[slot].Remove(activation);
+            }
         }
     }
 

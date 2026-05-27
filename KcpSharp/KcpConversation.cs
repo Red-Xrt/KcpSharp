@@ -1247,11 +1247,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private async Task RunUpdateOnActivationCore()
     {
         var cancellationToken = _updateLoopCts?.Token ?? new CancellationToken(true);
-        var activation = _updateActivation;
-        if (activation is null) return;
 
         while (!cancellationToken.IsCancellationRequested)
         {
+            var activation = _updateActivation;
+            if (activation is null || TransportClosed) return;
+
             var anyUpdate = false;
             var current = GetTimestamp();
 
@@ -1693,7 +1694,6 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 }
                 catch
                 {
-                    originalBuffer?.Dispose();
                     throw;
                 }
 
@@ -2288,8 +2288,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         try { _sendQueue.Dispose(); } catch { }
         try { _receiveQueue.Dispose(); } catch { }
 
-                try { _cachedFlushBuffer.Dispose(); } catch { }
-        try { _cachedAckFlushBuffer.Dispose(); } catch { }
+        WaitForUpdateLoopCompletion();
+        DisposeCachedFlushBuffers();
     }
 
     public async ValueTask DisposeAsync()
@@ -2300,23 +2300,40 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         try { _sendQueue.Dispose(); } catch { }
         try { _receiveQueue.Dispose(); } catch { }
 
-        await DisposeBackgroundTasksAsync().ConfigureAwait(false);
+        await WaitForUpdateLoopCompletionAsync().ConfigureAwait(false);
+        DisposeCachedFlushBuffers();
     }
 
-    private async Task DisposeBackgroundTasksAsync()
+    private void WaitForUpdateLoopCompletion()
     {
+        var updateLoopTask = _updateLoopTask;
+        if (updateLoopTask is null) return;
+        if (Task.CurrentId.HasValue && updateLoopTask.Id == Task.CurrentId.Value) return;
+
         try
         {
-            if (_updateLoopTask != null)
-            {
-                // We rely on SetTransportClosed() cancelling `_updateLoopCts`, unblocking network IO.
-                // Await completely to guarantee safe disposal of the pre-allocated buffers without use-after-free corruption.
-                await _updateLoopTask.ConfigureAwait(false);
-            }
+            // SetTransportClosed() cancels `_updateLoopCts` so the loop exits before flush buffers are freed.
+            updateLoopTask.GetAwaiter().GetResult();
         }
         catch { }
+    }
 
-                try { _cachedFlushBuffer.Dispose(); } catch { }
+    private async Task WaitForUpdateLoopCompletionAsync()
+    {
+        var updateLoopTask = _updateLoopTask;
+        if (updateLoopTask is null) return;
+        if (Task.CurrentId.HasValue && updateLoopTask.Id == Task.CurrentId.Value) return;
+
+        try
+        {
+            await updateLoopTask.ConfigureAwait(false);
+        }
+        catch { }
+    }
+
+    private void DisposeCachedFlushBuffers()
+    {
+        try { _cachedFlushBuffer.Dispose(); } catch { }
         try { _cachedAckFlushBuffer.Dispose(); } catch { }
     }
 }
