@@ -75,12 +75,14 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                 if (_forStream)
                 {
                     ClearPreviousOperation();
+                    ReleaseActiveWaitSlot();
                     exceptionToSet = ThrowHelper.NewTransportClosedForStreamException();
                     executeSetException = true;
                 }
                 else
                 {
                     ClearPreviousOperation();
+                    ReleaseActiveWaitSlot();
                     executeSetResult = true;
                 }
             }
@@ -370,6 +372,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
             int acquiredSlots = allowPartialSend ? 0 : requiredSlots;
             int addedToQueue = 0;
+            KcpPacketOwner? inFlightOwner = null;
 
             try
             {
@@ -394,6 +397,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     var size = buffer.Length > mss ? mss : buffer.Length;
 
                     var owner = KcpPacketOwner.SharedPool.Get();
+                    inFlightOwner = owner;
                     owner.Initialize(KcpPacketOwner.SharedPool, mss);
                     buffer.Slice(0, size).CopyTo(owner.Memory.Span);
                     var kcpBuffer = KcpBuffer.FromRetainedOwner(owner, owner.Memory, size);
@@ -406,10 +410,12 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     bytesWritten += size;
                     addedToQueue++;
                     anySegmentAdded = true;
+                    inFlightOwner = null;
                 }
             }
             catch
             {
+                inFlightOwner?.Dispose();
                 int unusedSlots = acquiredSlots - addedToQueue;
                 if (unusedSlots > 0)
                 {
@@ -511,6 +517,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             }
 
             int usedSlots = 0;
+            KcpPacketOwner? inFlightOwner = null;
             try
             {
                 lock (_syncRoot)
@@ -542,6 +549,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     {
                         int size = buffer.Length > mss ? mss : buffer.Length;
                         var owner = KcpPacketOwner.SharedPool.Get();
+                        inFlightOwner = owner;
                         owner.Initialize(KcpPacketOwner.SharedPool, mss);
                         buffer.Slice(0, size).Span.CopyTo(owner.Memory.Span);
                         var kcpBuffer = KcpBuffer.FromRetainedOwner(owner, owner.Memory, size);
@@ -554,8 +562,14 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                         usedSlots++;
                         currentFragmentIndex--;
                         anySegmentAdded = true;
+                        inFlightOwner = null;
                     }
                 }
+            }
+            catch
+            {
+                inFlightOwner?.Dispose();
+                throw;
             }
             finally
             {
@@ -658,6 +672,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             }
 
             int usedSlots = 0;
+            KcpPacketOwner? inFlightOwner = null;
             try
             {
                 lock (_syncRoot)
@@ -688,6 +703,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                     {
                         int size = buffer.Length > mss ? mss : buffer.Length;
                         var owner = KcpPacketOwner.SharedPool.Get();
+                        inFlightOwner = owner;
                         owner.Initialize(KcpPacketOwner.SharedPool, mss);
                         buffer.Slice(0, size).Span.CopyTo(owner.Memory.Span);
                         var kcpBuffer = KcpBuffer.FromRetainedOwner(owner, owner.Memory, size);
@@ -700,8 +716,14 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                         usedSlots++;
                         currentFragmentIndex--;
                         anySegmentAdded = true;
+                        inFlightOwner = null;
                     }
                 }
+            }
+            catch
+            {
+                inFlightOwner?.Dispose();
+                throw;
             }
             finally
             {
@@ -780,6 +802,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             if (_activeWait && !_signaled)
             {
                 ClearPreviousOperation();
+                ReleaseActiveWaitSlot();
                 exceptionToSet = ThrowHelper.NewOperationCanceledExceptionForCancelPendingSend(innerException, cancellationToken);
                 executeSetException = true;
             }
@@ -804,6 +827,7 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
             {
                 var cancellationToken = _cancellationToken;
                 ClearPreviousOperation();
+                ReleaseActiveWaitSlot();
                 exceptionToSet = new OperationCanceledException(cancellationToken);
                 executeSetException = true;
             }
@@ -823,6 +847,16 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
         _waitForByteCount = default;
         _waitForSegmentCount = default;
         _cancellationToken = default;
+    }
+
+    private void ReleaseActiveWaitSlot()
+    {
+        _activeWait = false;
+        // Unregister (non-blocking) instead of Dispose: this runs under _syncRoot, and Dispose would
+        // block waiting for a concurrently-firing SetCanceled callback that also needs _syncRoot -> deadlock.
+        // The _signaled flag already guarantees exactly-once completion.
+        _cancellationRegistration.Unregister();
+        _cancellationRegistration = default;
     }
 
     public void NotifyAckListChanged(bool itemsListNotEmpty)
@@ -921,12 +955,14 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
                 if (_forStream)
                 {
                     ClearPreviousOperation();
+                    ReleaseActiveWaitSlot();
                     exceptionToSet = ThrowHelper.NewTransportClosedForStreamException();
                     executeSetException = true;
                 }
                 else
                 {
                     ClearPreviousOperation();
+                    ReleaseActiveWaitSlot();
                     executeSetResult = true;
                 }
             }
@@ -942,9 +978,6 @@ internal sealed class KcpSendQueue : IValueTaskSource<bool>, IValueTaskSource, I
 
             _transportClosed = true;
             Interlocked.Exchange(ref _unflushedBytes, 0);
-
-            // Wake up waiters
-            try { _spaceSemaphore.Dispose(); } catch (ObjectDisposedException) { }
         }
 
         if (executeSetException)

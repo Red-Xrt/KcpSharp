@@ -68,7 +68,7 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
             return default;
         }
 
-        if (_transportClosed || _disposed)
+        if (_transportClosed || Volatile.Read(ref _disposeState) != NotDisposed)
         {
             bufferOwner?.Dispose();
             return default;
@@ -379,9 +379,16 @@ internal sealed class KcpMultiplexConnection<T> : IKcpTransport, IKcpBatchTransp
     /// <returns>The conversation unregistered. Returns null when the conversation with the specified ID is not found.</returns>
     public IKcpConversation? UnregisterConversation(uint id, out T? state)
     {
-        if (!_transportClosed && !_disposed && _conversations.TryRemove(id, out var value))
+        if (_disposed) 
         {
-            value.Conversation.SetTransportClosed();
+            state = default;
+            return default;
+        }
+
+        if (_conversations.TryRemove(id, out var value))
+        {
+            if (!_transportClosed)
+                value.Conversation.SetTransportClosed();
             state = value.State;
             if (_disposeAction is not null) _disposeAction.Invoke(state);
             return value.Conversation;

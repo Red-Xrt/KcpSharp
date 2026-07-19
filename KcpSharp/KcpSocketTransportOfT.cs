@@ -58,6 +58,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     private T? _connection;
     private CancellationTokenSource? _cts;
     private bool _disposed;
+    private Thread? _receiveThread;
+    private Task? _receiveTask;
 
     private readonly Memory<byte>[][] _batchBuffers;
     private unsafe void* _batchBufferSlab;
@@ -148,7 +150,11 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         CancellationToken cancellationToken)
     {
         if (_disposed) return default;
-        if (packet.Length > _mtu) return default;
+        if (packet.Length > _mtu)
+        {
+            KcpMetrics.PacketsDropped.Add(1);
+            throw new ArgumentOutOfRangeException(nameof(packet), packet.Length, $"Packet length exceeds transport MTU ({_mtu}).");
+        }
 
         return SendCoreAsync(packet, endpoint, cancellationToken);
     }
@@ -301,8 +307,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                                         if (error == 4 /* EINTR */) continue;
                                         if (error == 11 /* EAGAIN */ || error == 35 /* EWOULDBLOCK on macOS */)
                                         {
-                                            // Drop the batch or retry with a yield — UDP has no reliability guarantee anyway
-                                            break; // packet loss is acceptable; let KCP RTO handle retransmit
+                                            Thread.SpinWait(128);
+                                            continue;
                                         }
                                         throw new SocketException(error);
                                     }
@@ -328,26 +334,39 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
             {
                 for (int i = 0; i < countToFlush; i++)
                 {
-                    try
+                    int spinCount = 0;
+                    while (!cancellationToken.IsCancellationRequested)
                     {
-                        await _socket
-                            .SendToAsync(_batchBuffers[activeSet][i].Slice(0, _batchSizes[activeSet][i]),
-                                         SocketFlags.None,
-                                         _batchEndpoints[activeSet][i]!,
-                                         cancellationToken)
-                            .ConfigureAwait(false);
-                    }
-                    catch (SocketException ex) when (
-                        ex.SocketErrorCode == SocketError.WouldBlock ||
-                        ex.SocketErrorCode == SocketError.TryAgain ||
-                        ex.SocketErrorCode == SocketError.Interrupted)
-                    {
-                        continue; // Retry/skip packet
-                    }
-                    catch (SocketException ex)
-                    {
-                        HandleExceptionWrapper(ex);
-                        break;
+                        try
+                        {
+                            await _socket
+                                .SendToAsync(_batchBuffers[activeSet][i].Slice(0, _batchSizes[activeSet][i]),
+                                             SocketFlags.None,
+                                             _batchEndpoints[activeSet][i]!,
+                                             cancellationToken)
+                                .ConfigureAwait(false);
+                            break;
+                        }
+                        catch (SocketException ex) when (
+                            ex.SocketErrorCode == SocketError.WouldBlock ||
+                            ex.SocketErrorCode == SocketError.TryAgain ||
+                            ex.SocketErrorCode == SocketError.Interrupted)
+                        {
+                            spinCount++;
+                            if (spinCount > 1024)
+                            {
+                                KcpMetrics.PacketsDropped.Add(1);
+                                break;
+                            }
+
+                            Thread.SpinWait(128);
+                        }
+                        catch (SocketException ex)
+                        {
+                            HandleExceptionWrapper(ex);
+                            i = countToFlush;
+                            break;
+                        }
                     }
                 }
             }
@@ -491,17 +510,17 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
     {
         if (OperatingSystem.IsLinux() && _socket.Handle != IntPtr.Zero)
         {
-            _ = Task.Factory.StartNew(RunReceiveLoopLinuxAsync, default, TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
+            _receiveTask = Task.Factory.StartNew(RunReceiveLoopLinuxAsync, default, TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default);
             return;
         }
 
-        var thread = new System.Threading.Thread(RunReceiveLoopWindowsSync)
+        _receiveThread = new System.Threading.Thread(RunReceiveLoopWindowsSync)
         {
             IsBackground = true,
             Priority = System.Threading.ThreadPriority.AboveNormal,
             Name = "KcpReceiveThread"
         };
-        thread.Start();
+        _receiveThread.Start();
     }
 
     private void RunReceiveLoopWindowsSync()
@@ -516,16 +535,33 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
         try
         {
+            int emptyPollCount = 0;
+            int currentPollTimeout = 1000; // 1 ms
+
             while (!cancellationToken.IsCancellationRequested)
             {
                 int bytesReceived = 0;
 
                 try
                 {
-                    // Blocking receive first to wait for any data (avoids CPU spin)
+                    if (!_socket.Poll(currentPollTimeout, SelectMode.SelectRead))
+                    {
+                        emptyPollCount++;
+                        if (emptyPollCount >= 10)
+                            currentPollTimeout = 5000; // 5 ms idle
+                        continue;
+                    }
+
+                    emptyPollCount = 0;
+                    currentPollTimeout = 1000;
+
                     bytesReceived = _socket.ReceiveFrom(localBuffer, 0, 65536, SocketFlags.None, ref remoteEndpoint);
                 }
-                catch (SocketException ex) when (ex.SocketErrorCode == SocketError.ConnectionReset || ex.SocketErrorCode == SocketError.Interrupted)
+                catch (SocketException ex) when (
+                    ex.SocketErrorCode == SocketError.WouldBlock ||
+                    ex.SocketErrorCode == SocketError.TryAgain ||
+                    ex.SocketErrorCode == SocketError.ConnectionReset ||
+                    ex.SocketErrorCode == SocketError.Interrupted)
                 {
                     continue;
                 }
@@ -541,6 +577,9 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
                 if (cancellationToken.IsCancellationRequested) break;
 
+                if (bytesReceived <= 0)
+                    continue;
+
                 IPEndPoint? ep = ResolveEndpoint(remoteEndpoint, ref cachedEndpoint);
                 if (ep != null)
                 {
@@ -554,6 +593,8 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
                     try
                     {
                         bytesReceived = _socket.ReceiveFrom(localBuffer, 0, 65536, SocketFlags.None, ref remoteEndpoint);
+                        if (bytesReceived <= 0)
+                            continue;
                         ep = ResolveEndpoint(remoteEndpoint, ref cachedEndpoint);
                         if (ep != null)
                         {
@@ -622,6 +663,11 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
 
     private void ProcessReceivedPacket(byte[] buffer, int bytesReceived, IPEndPoint ep)
     {
+        if (_disposed) return;
+
+        if (bytesReceived <= 0)
+            return;
+
         if (bytesReceived < KcpGlobalVars.HEADER_LENGTH_WITHOUT_CONVID)
             return;
 
@@ -633,16 +679,35 @@ internal abstract class KcpSocketTransport<T> : IKcpTransport, IKcpBatchTranspor
         }
 
         var connection = _connection;
-        if (connection != null && connection is IKcpPacketSink sink)
+        if (connection is not null && connection is IKcpPacketSink sink)
         {
             var owner = KcpPacketOwner.SharedPool.Get();
             owner.Initialize(KcpPacketOwner.SharedPool, bytesReceived);
             packetMemory.Span.CopyTo(owner.Memory.Span);
-            FireAndForgetInput(sink.InputPacketAsync(owner.Memory.Slice(0, bytesReceived), ep, owner, default));
+            DispatchInputValueTask(sink.InputPacketAsync(owner.Memory.Slice(0, bytesReceived), ep, owner, default));
         }
     }
 
-private async Task RunReceiveLoopLinuxAsync()
+    private void DispatchInputValueTask(ValueTask task)
+    {
+        if (task.IsCompleted)
+        {
+            try
+            {
+                task.GetAwaiter().GetResult();
+            }
+            catch (Exception ex)
+            {
+                HandleExceptionWrapper(ex);
+            }
+
+            return;
+        }
+
+        FireAndForgetInput(task);
+    }
+
+    private async Task RunReceiveLoopLinuxAsync()
     {
         // Runs on the dedicated LongRunning thread created by Task.Factory.StartNew.
         // Do NOT await Task.Yield() here — that posts the continuation to the shared
@@ -669,8 +734,6 @@ private async Task RunReceiveLoopLinuxAsync()
         }
 
         IPEndPoint? cachedEndpoint = null;
-        ValueTask[] tasks = new ValueTask[maxBatchSize];
-
 
         try
         {
@@ -735,7 +798,6 @@ private async Task RunReceiveLoopLinuxAsync()
                 if (cancellationToken.IsCancellationRequested) break;
 
                 int ret = 0;
-                int taskCount = 0;
 
                 unsafe
                 {
@@ -773,6 +835,7 @@ private async Task RunReceiveLoopLinuxAsync()
                             // Processing a truncated packet can lead to parsing errors or injection attacks.
                             if ((pMsgvec[i].msg_hdr.msg_flags & 0x20) != 0)
                             {
+                                KcpMetrics.PacketsDropped.Add(1);
                                 continue;
                             }
 
@@ -805,7 +868,11 @@ private async Task RunReceiveLoopLinuxAsync()
                             else
                             {
                                 var ep = remoteEndpoint.Create(receivedAddress) as IPEndPoint;
-                                if (ep is null) continue;
+                                if (ep is null)
+                                {
+                                    KcpMetrics.PacketsDropped.Add(1);
+                                    continue;
+                                }
                                 endpoint = ep;
                                 cachedEndpoint = ep;
 
@@ -834,27 +901,16 @@ private async Task RunReceiveLoopLinuxAsync()
                                 continue;
                             }
 
-                            if (connection is IKcpPacketSink sink)
+                            if (_connection is IKcpPacketSink sink)
                             {
                                 var packetOwner = KcpPacketOwner.SharedPool.Get();
                                 packetOwner.Initialize(KcpPacketOwner.SharedPool, (int)bytesReceived);
                                 packet.CopyTo(packetOwner.Memory.Slice(0, (int)bytesReceived));
 
-                                var inputTask = sink.InputPacketAsync(packetOwner.Memory.Slice(0, (int)bytesReceived), endpoint, packetOwner, cancellationToken);
-                                if (!inputTask.IsCompletedSuccessfully)
-                                {
-                                    tasks[taskCount++] = inputTask;
-                                }
+                                DispatchInputValueTask(sink.InputPacketAsync(packetOwner.Memory.Slice(0, (int)bytesReceived), endpoint, packetOwner, cancellationToken));
                             }
                         }
                     }
-                }
-
-                // Await tasks outside of the unsafe block
-                for (int i = 0; i < taskCount; i++)
-                {
-                    FireAndForgetInput(tasks[i]);
-                    tasks[i] = default; // clear
                 }
             }
         }
@@ -914,24 +970,31 @@ private async Task RunReceiveLoopLinuxAsync()
     {
         if (!_disposed)
         {
-            unsafe
+            _disposed = true;
+
+            var cts = Interlocked.Exchange(ref _cts, null);
+            if (cts is not null)
             {
-                if (_batchBufferSlab != null)
-                {
-                    System.Runtime.InteropServices.NativeMemory.Free(_batchBufferSlab);
-                    _batchBufferSlab = null;
-                }
+                try { cts.Cancel(); } catch { }
+                cts.Dispose();
+            }
+
+            try { _socket.Close(); } catch { }
+
+            var receiveThread = _receiveThread;
+            if (receiveThread is not null && receiveThread.IsAlive && receiveThread != Thread.CurrentThread)
+            {
+                try { receiveThread.Join(TimeSpan.FromSeconds(5)); } catch { }
+            }
+
+            var receiveTask = _receiveTask;
+            if (receiveTask is not null)
+            {
+                try { receiveTask.Wait(TimeSpan.FromSeconds(5)); } catch { }
             }
 
             if (disposing)
             {
-                var cts = Interlocked.Exchange(ref _cts, null);
-                if (cts is not null)
-                {
-                    cts.Cancel();
-                    cts.Dispose();
-                }
-
                 try
                 {
                     if (_connection is IAsyncDisposable asyncDisposable)
@@ -949,9 +1012,21 @@ private async Task RunReceiveLoopLinuxAsync()
                 }
             }
 
+            // Free the unmanaged batch slab only after the connection (and its flush loop) is fully stopped.
+            // FlushBatchAsync reads from _batchBuffers, which alias this slab; freeing earlier races with an
+            // in-flight sendmmsg/SendToAsync and causes a use-after-free of native memory.
+            unsafe
+            {
+                if (_batchBufferSlab != null)
+                {
+                    System.Runtime.InteropServices.NativeMemory.Free(_batchBufferSlab);
+                    _batchBufferSlab = null;
+                }
+            }
+
             _connection = null;
-            _cts = null;
-            _disposed = true;
+            _receiveThread = null;
+            _receiveTask = null;
         }
     }
 

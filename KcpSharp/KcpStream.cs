@@ -1,4 +1,5 @@
 using System.IO.Pipelines;
+using System.Threading;
 
 namespace KcpSharp;
 
@@ -11,6 +12,7 @@ public sealed class KcpStream : Stream
     private KcpConversation? _conversation;
     private readonly PipeReader? _input;
     private readonly PipeWriter? _output;
+    private int _disposed;
 
     /// <summary>
     ///     Create a stream wrapper over an existing <see cref="KcpConversation" /> instance.
@@ -78,14 +80,8 @@ public sealed class KcpStream : Stream
         {
             if (_conversation is not null)
             {
-                try
-                {
-                    return _conversation.TryPeek(out var result) && result.BytesReceived != 0;
-                }
-                catch (InvalidOperationException)
-                {
-                    throw; // Documented exception
-                }
+                // Propagates InvalidOperationException when a concurrent receive is active (documented).
+                return _conversation.TryPeek(out var result) && result.BytesReceived != 0;
             }
             if (_input is not null)
             {
@@ -136,7 +132,7 @@ public sealed class KcpStream : Stream
     {
         if (_conversation is not null)
         {
-            return _conversation.FlushAsync(cancellationToken).AsTask();
+            return _conversation.FlushForStreamAsync(cancellationToken).AsTask();
         }
         else if (_output is not null)
         {
@@ -212,10 +208,19 @@ public sealed class KcpStream : Stream
     /// <inheritdoc />
     protected override void Dispose(bool disposing)
     {
+        if (disposing && Interlocked.Exchange(ref _disposed, 1) == 0)
+        {
 #pragma warning disable CS0618
-        if (disposing && _ownsConversation) _conversation?.Dispose();
+            if (_ownsConversation)
+            {
+                _conversation?.Dispose();
+                _conversation = null;
+            }
 #pragma warning restore CS0618
-        _conversation = null;
+            try { _output?.Complete(); } catch { }
+            try { _input?.Complete(); } catch { }
+        }
+
         base.Dispose(disposing);
     }
 
@@ -229,6 +234,9 @@ public sealed class KcpStream : Stream
     /// <remarks>WARNING: Do NOT await this ValueTask more than once.</remarks>
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
+        if (_disposed != 0)
+            throw new ObjectDisposedException(nameof(KcpStream));
+
         if (_conversation is not null)
         {
             return await _conversation.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
@@ -265,6 +273,9 @@ public sealed class KcpStream : Stream
     /// <remarks>WARNING: Do NOT await this ValueTask more than once.</remarks>
     public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
     {
+        if (_disposed != 0)
+            throw new ObjectDisposedException(nameof(KcpStream));
+
         if (_conversation is not null)
         {
             await _conversation.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
@@ -289,11 +300,26 @@ public sealed class KcpStream : Stream
     /// <returns>A task that represents the asynchronous dispose operation.</returns>
     public override async ValueTask DisposeAsync()
     {
-        if (_conversation is not null)
+        if (Interlocked.Exchange(ref _disposed, 1) == 0)
         {
-            if (_ownsConversation)
-                await _conversation.DisposeAsync().ConfigureAwait(false);
-            _conversation = null;
+            if (_conversation is not null)
+            {
+                if (_ownsConversation)
+                {
+                    await _conversation.DisposeAsync().ConfigureAwait(false);
+                    _conversation = null;
+                }
+            }
+
+            if (_output is not null)
+            {
+                await _output.CompleteAsync().ConfigureAwait(false);
+            }
+
+            if (_input is not null)
+            {
+                await _input.CompleteAsync().ConfigureAwait(false);
+            }
         }
 
         await base.DisposeAsync().ConfigureAwait(false);

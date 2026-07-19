@@ -93,16 +93,42 @@ internal static class KcpGlobalTickEngine
                 s_wheel[slot].Add(activation);
             }
 
+            EnsureTimerRunning();
+        }
+    }
+
+    private static void EnsureTimerRunning()
+    {
+        lock (s_engineLock)
+        {
+            if (s_activations.IsEmpty) return;
+            if (s_tickTask is { IsCompleted: false }) return;
+        }
+
+        if (Interlocked.CompareExchange(ref s_isTimerRunning, 1, 0) != 0)
+        {
             lock (s_engineLock)
             {
-                if (s_isTimerRunning == 0)
-                {
-                    s_isTimerRunning = 1;
-                    s_cts = new CancellationTokenSource();
-                    s_lastTickMs = (uint)Environment.TickCount;
-                    s_tickTask = Task.Run(() => TickLoopAsync(s_cts.Token));
-                }
+                if (s_activations.IsEmpty) return;
+                if (s_tickTask is { IsCompleted: false }) return;
             }
+
+            if (Interlocked.CompareExchange(ref s_isTimerRunning, 1, 0) != 0)
+                return;
+        }
+
+        lock (s_engineLock)
+        {
+            if (s_activations.IsEmpty)
+            {
+                Interlocked.Exchange(ref s_isTimerRunning, 0);
+                return;
+            }
+
+            s_cts?.Dispose();
+            s_cts = new CancellationTokenSource();
+            s_lastTickMs = (uint)Environment.TickCount;
+            s_tickTask = Task.Run(() => TickLoopAsync(s_cts.Token));
         }
     }
 
@@ -144,12 +170,14 @@ internal static class KcpGlobalTickEngine
 
                 foreach (var kvp in acts)
                 {
-                    kvp.Key.Dispose();
+#pragma warning disable CS0420
+                    Volatile.Write(ref kvp.Value._unregisteredRef, 1);
+#pragma warning restore CS0420
                 }
 
                 s_cts.Dispose();
                 s_cts = null;
-                s_isTimerRunning = 0;
+                s_tickTask = null;
             }
         }
 
@@ -177,14 +205,14 @@ internal static class KcpGlobalTickEngine
                 {
                     lock (s_engineLock)
                     {
-                        if (s_activations.IsEmpty)
-                        {
-                            s_cts?.Cancel();
-                            s_cts?.Dispose();
-                            s_cts = null;
-                            s_isTimerRunning = 0;
-                            return;
-                        }
+                        if (!s_activations.IsEmpty)
+                            continue;
+
+                        s_cts?.Cancel();
+                        s_cts?.Dispose();
+                        s_cts = null;
+                        s_tickTask = null;
+                        return;
                     }
                 }
 
@@ -264,6 +292,10 @@ internal static class KcpGlobalTickEngine
         catch (OperationCanceledException)
         {
             // Expected during shutdown
+        }
+        finally
+        {
+            Interlocked.Exchange(ref s_isTimerRunning, 0);
         }
     }
 

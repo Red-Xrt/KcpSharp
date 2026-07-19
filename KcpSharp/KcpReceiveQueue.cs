@@ -434,6 +434,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
             {
                 operationMode = _operationMode;
                 ClearPreviousOperation(true);
+                ReleaseActiveWaitSlot();
                 exceptionToSet = ThrowHelper.NewOperationCanceledExceptionForCancelPendingReceive(innerException, cancellationToken);
                 executeSetException = true;
             }
@@ -465,6 +466,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
                 var cancellationToken = _cancellationToken;
                 operationMode = _operationMode;
                 ClearPreviousOperation(true);
+                ReleaseActiveWaitSlot();
                 exceptionToSet = new OperationCanceledException(cancellationToken);
                 executeSetException = true;
             }
@@ -487,6 +489,16 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
         _buffer = default;
         _writer = null;
         _cancellationToken = default;
+    }
+
+    private void ReleaseActiveWaitSlot()
+    {
+        _activeWait = false;
+        // Unregister (non-blocking) instead of Dispose: this runs under _syncRoot, and Dispose would
+        // block waiting for a concurrently-firing SetCanceled callback that also needs _syncRoot -> deadlock.
+        // The _signaled flag already guarantees exactly-once completion.
+        _cancellationRegistration.Unregister();
+        _cancellationRegistration = default;
     }
 
     internal void Enqueue(in KcpBuffer buffer, byte fragment)
@@ -655,7 +667,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
             return;
         }
 
-        Debug.Assert(_operationMode == 0);
+        Debug.Assert(_operationMode == 0 || _operationMode == 4);
 
         // ensure buffer is big enough
         var bytesInPacket = 0;
@@ -806,6 +818,7 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
             {
                 capturedOperationMode = _operationMode;
                 ClearPreviousOperation(true);
+                ReleaseActiveWaitSlot();
                 executeSetResult = true;
             }
 
@@ -841,6 +854,9 @@ internal sealed class KcpReceiveQueue : IValueTaskSource<KcpConversationReceiveR
     /// </summary>
     public int GetQueueSize()
     {
-        return _completedPacketsCount;
+        lock (_syncRoot)
+        {
+            return _completedPacketsCount;
+        }
     }
 }

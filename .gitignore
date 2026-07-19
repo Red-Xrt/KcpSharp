@@ -1,5 +1,10 @@
 bin/
 obj/
+# Visual Studio
+.vs/
+*.user
+# Test results
+[Tt]est[Rr]esult*/
 # Default ignored files
 /shelf/
 /workspace.xml

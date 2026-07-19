@@ -30,8 +30,6 @@ internal sealed class AsyncCapacityReserve : IDisposable
         if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
         if (count == 0) return true;
 
-        if (_hasWaiters == 1) return false;
-
         return TryReserveInternal(count);
     }
 
@@ -208,10 +206,12 @@ internal sealed class AsyncCapacityReserve : IDisposable
             {
                 if (_released) return;
                 _released = true;
-                _cancellationRegistration.Dispose();
+                // Unregister (non-blocking): Complete runs while the parent holds its lock, and the
+                // CancelWait callback acquires the parent lock first. Dispose() would block waiting for
+                // that callback, which is blocked on the parent lock -> deadlock. _released guards correctness.
+                _cancellationRegistration.Unregister();
                 _mrvtsc.SetResult(true);
             }
-            ReturnToPool();
         }
 
         public void DisposeWithException(Exception ex)
@@ -220,10 +220,10 @@ internal sealed class AsyncCapacityReserve : IDisposable
             {
                 if (_released) return;
                 _released = true;
-                _cancellationRegistration.Dispose();
+                // See Complete(): Unregister is non-blocking to avoid a lock-ordering deadlock with CancelWait.
+                _cancellationRegistration.Unregister();
                 _mrvtsc.SetException(ex);
             }
-            ReturnToPool();
         }
 
         private void CancelWait()
@@ -246,7 +246,6 @@ internal sealed class AsyncCapacityReserve : IDisposable
                         _mrvtsc.SetException(new OperationCanceledException(_cancellationToken));
                     }
                 }
-                ReturnToPool();
             }
         }
 
@@ -257,7 +256,17 @@ internal sealed class AsyncCapacityReserve : IDisposable
             WaiterPool.Return(this);
         }
 
-        bool IValueTaskSource<bool>.GetResult(short token) => _mrvtsc.GetResult(token);
+        bool IValueTaskSource<bool>.GetResult(short token)
+        {
+            try
+            {
+                return _mrvtsc.GetResult(token);
+            }
+            finally
+            {
+                ReturnToPool();
+            }
+        }
         ValueTaskSourceStatus IValueTaskSource<bool>.GetStatus(short token) => _mrvtsc.GetStatus(token);
         void IValueTaskSource<bool>.OnCompleted(Action<object?> continuation, object? state, short token, ValueTaskSourceOnCompletedFlags flags) => _mrvtsc.OnCompleted(continuation, state, token, flags);
     }

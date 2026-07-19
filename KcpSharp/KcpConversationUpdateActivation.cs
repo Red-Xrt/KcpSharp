@@ -60,6 +60,7 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
             {
                 _signaled = true;
                 _cancellationToken = default;
+                ReleaseActiveWaitSlot();
                 executeSetResult = true;
             }
         }
@@ -144,6 +145,7 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
                 var cancellationToken = _cancellationToken;
                 _signaled = true;
                 _cancellationToken = default;
+                ReleaseActiveWaitSlot();
                 exceptionToSet = new OperationCanceledException(cancellationToken);
                 executeSetException = true;
             }
@@ -153,6 +155,16 @@ internal sealed class KcpConversationUpdateActivation : IValueTaskSource<KcpConv
         {
             _mrvtsc.SetException(exceptionToSet!);
         }
+    }
+
+    private void ReleaseActiveWaitSlot()
+    {
+        _activeWait = false;
+        // Unregister (non-blocking) instead of Dispose: this runs under SyncRoot, and Dispose would
+        // block waiting for a concurrently-firing SetCanceled callback that also needs SyncRoot -> deadlock.
+        // The _signaled flag already guarantees exactly-once completion.
+        _cancellationRegistration.Unregister();
+        _cancellationRegistration = default;
     }
 
     ValueTaskSourceStatus IValueTaskSource<KcpConversationUpdateNotification>.GetStatus(short token)
@@ -288,7 +300,22 @@ internal sealed class KcpReceiveRingBuffer : IDisposable
         }
     }
 
-    public bool HasItems => _head != _tail;
+    public bool HasItems
+    {
+        get
+        {
+            bool lockTaken = false;
+            try
+            {
+                _spinLock.Enter(ref lockTaken);
+                return _head != _tail;
+            }
+            finally
+            {
+                if (lockTaken) _spinLock.Exit(false);
+            }
+        }
+    }
 
     public void Dispose()
     {

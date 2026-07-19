@@ -38,6 +38,7 @@ internal sealed class KcpRawSendOperation : IValueTaskSource<bool>, IDisposable
             if (_activeWait && !_signaled)
             {
                 ClearPreviousOperation();
+                ReleaseActiveWaitSlot();
                 executeSetResult = true;
             }
 
@@ -115,6 +116,7 @@ internal sealed class KcpRawSendOperation : IValueTaskSource<bool>, IDisposable
             if (_activeWait && !_signaled)
             {
                 ClearPreviousOperation();
+                ReleaseActiveWaitSlot();
                 exceptionToSet = ThrowHelper.NewOperationCanceledExceptionForCancelPendingSend(innerException, cancellationToken);
                 executeSetException = true;
             }
@@ -138,6 +140,7 @@ internal sealed class KcpRawSendOperation : IValueTaskSource<bool>, IDisposable
             {
                 var cancellationToken = _cancellationToken;
                 ClearPreviousOperation();
+                ReleaseActiveWaitSlot();
                 exceptionToSet = new OperationCanceledException(cancellationToken);
                 executeSetException = true;
             }
@@ -156,14 +159,32 @@ internal sealed class KcpRawSendOperation : IValueTaskSource<bool>, IDisposable
         _cancellationToken = default;
     }
 
+    private void ReleaseActiveWaitSlot()
+    {
+        _activeWait = false;
+        // Unregister (non-blocking) instead of Dispose: this runs under _syncRoot, and Dispose would
+        // block waiting for a concurrently-firing SetCanceled callback that also needs _syncRoot -> deadlock.
+        // The _signaled flag already guarantees exactly-once completion.
+        _cancellationRegistration.Unregister();
+        _cancellationRegistration = default;
+    }
+
     public bool TryConsume(Memory<byte> buffer, out int bytesWritten)
     {
         bool executeSetException = false;
         bool executeSetResult = false;
+        bool executeSetResultOnClose = false;
         lock (_syncRoot)
         {
             if (_transportClosed || _disposed)
             {
+                if (_activeWait && !_signaled)
+                {
+                    ClearPreviousOperation();
+                    ReleaseActiveWaitSlot();
+                    executeSetResultOnClose = true;
+                }
+
                 bytesWritten = 0;
                 return false;
             }
@@ -196,6 +217,12 @@ internal sealed class KcpRawSendOperation : IValueTaskSource<bool>, IDisposable
             return false;
         }
 
+        if (executeSetResultOnClose)
+        {
+            _mrvtsc.SetResult(false);
+            return false;
+        }
+
         if (executeSetResult)
         {
             _mrvtsc.SetResult(true);
@@ -219,6 +246,7 @@ internal sealed class KcpRawSendOperation : IValueTaskSource<bool>, IDisposable
             if (_activeWait && !_signaled)
             {
                 ClearPreviousOperation();
+                ReleaseActiveWaitSlot();
                 executeSetResult = true;
             }
 

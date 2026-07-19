@@ -24,6 +24,7 @@ internal sealed class KcpRawChannel : IKcpConversation, IKcpExceptionProducer<Kc
 
     private CancellationTokenSource? _sendLoopCts;
     private Task _sendLoopTask = Task.CompletedTask;
+    private int _disposed;
 
     /// <summary>
     ///     Construct an unreliable channel with no conversation ID.
@@ -96,6 +97,12 @@ internal sealed class KcpRawChannel : IKcpConversation, IKcpExceptionProducer<Kc
 
     ValueTask IKcpPacketSink.InputPacketAsync(ReadOnlyMemory<byte> packet, IPEndPoint remoteEndPoint, System.Buffers.IMemoryOwner<byte>? bufferOwner, CancellationToken cancellationToken)
     {
+        if (_disposed != 0 || TransportClosed)
+        {
+            bufferOwner?.Dispose();
+            return default;
+        }
+
         ReadOnlySpan<byte> span = packet.Span;
         var overhead = _id.HasValue ? KcpGlobalVars.CONVID_LENGTH : 0;
         if (span.Length < overhead || span.Length > _mtu)
@@ -138,6 +145,7 @@ internal sealed class KcpRawChannel : IKcpConversation, IKcpExceptionProducer<Kc
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
         SetTransportClosed();
         try { await _sendLoopTask.ConfigureAwait(false); } catch { }
         _receiveQueue.Dispose();
@@ -146,9 +154,24 @@ internal sealed class KcpRawChannel : IKcpConversation, IKcpExceptionProducer<Kc
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
         SetTransportClosed();
+        WaitForSendLoopCompletion();
         _receiveQueue.Dispose();
         _sendOperation.Dispose();
+    }
+
+    private void WaitForSendLoopCompletion()
+    {
+        var sendLoopTask = _sendLoopTask;
+        if (sendLoopTask is null) return;
+        if (Task.CurrentId.HasValue && sendLoopTask.Id == Task.CurrentId.Value) return;
+
+        try
+        {
+            sendLoopTask.GetAwaiter().GetResult();
+        }
+        catch { }
     }
 
     /// <summary>

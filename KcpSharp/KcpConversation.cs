@@ -12,6 +12,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 {
     private readonly System.Threading.Lock _sndBufLock = new();
     private readonly System.Threading.Lock _rtoLock = new();
+    private readonly System.Threading.Lock _cwndLock = new();
         private readonly KcpPacketHeader[] _cachedBatchHeaders;
     private readonly KcpBuffer[] _cachedBatchData;
     private readonly System.Threading.Lock _rcvBufLock = new();
@@ -502,7 +503,8 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         }
         catch (Exception ex)
         {
-            return HandleFlushException(ex);
+            HandleFlushException(ex);
+            return false;
         }
     }
 
@@ -671,7 +673,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
             // calculate window size
             var cwnd = Math.Min(_snd_wnd, Volatile.Read(ref _rmt_wnd));
-            if (!_nocwnd) cwnd = Math.Min(_cwnd, cwnd);
+            if (!_nocwnd)
+            {
+                uint congestionWindow;
+                lock (_cwndLock) congestionWindow = _cwnd;
+                cwnd = Math.Min(congestionWindow, cwnd);
+            }
 
 #pragma warning disable CS0420 // volatile ref bypass ok for Volatile.Read
             // move data from snd_queue to snd_buf
@@ -792,6 +799,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                     var batchData = _cachedBatchData;
                     int BatchSize = _cachedBatchHeaders.Length;
                     int batchCount = 0;
+                    int batchWireBytes = 0;
 
                     lock (_sndBufLock)
                     {
@@ -858,7 +866,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                                 var data = item.Data;
                                 var need = packetHeaderSize + data.Length;
 
-                                if (size + need > sizeLimitBeforePostBuffer)
+                                if (size + batchWireBytes + need > sizeLimitBeforePostBuffer)
                                 {
                                     needsFlush = true;
                                     break;
@@ -897,6 +905,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                                 // Snapshot for out-of-lock encoding
                                 batchHeaders[batchCount] = header;
                                 batchData[batchCount] = data.Retain();
+                                batchWireBytes += need;
                                 batchCount++;
                             }
 
@@ -1102,38 +1111,41 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             }
 
             // update window
-            var updatedCwnd = _cwnd;
-            var incr = _incr;
-
-            // update sshthresh
-            if (lost)
+            lock (_cwndLock)
             {
-                cwnd = Math.Min(_snd_wnd, Volatile.Read(ref _rmt_wnd));
-                if (!_nocwnd) cwnd = Math.Min(_cwnd, cwnd);
+                var updatedCwnd = _cwnd;
+                var incr = _incr;
 
-                _ssthresh = Math.Max(cwnd / 2, IKCP_THRESH_MIN);
-                updatedCwnd = 1;
-                incr = (uint)_mss;
+                // update sshthresh
+                if (lost)
+                {
+                    cwnd = Math.Min(_snd_wnd, Volatile.Read(ref _rmt_wnd));
+                    if (!_nocwnd) cwnd = Math.Min(_cwnd, cwnd);
+
+                    _ssthresh = Math.Max(cwnd / 2, IKCP_THRESH_MIN);
+                    updatedCwnd = 1;
+                    incr = (uint)_mss;
+                }
+                else if (change)
+                {
+                    var inflight = _snd_nxt - _snd_una;
+                    _ssthresh = Math.Max(inflight / 2, IKCP_THRESH_MIN);
+                    updatedCwnd = _ssthresh + resent;
+                    incr = updatedCwnd * (uint)_mss;
+                }
+
+                if (updatedCwnd < 1)
+                {
+                    updatedCwnd = 1;
+                    incr = (uint)_mss;
+                }
+
+                var rmt_wnd = Volatile.Read(ref _rmt_wnd);
+                if (updatedCwnd > rmt_wnd) updatedCwnd = rmt_wnd;
+
+                _cwnd = updatedCwnd;
+                _incr = incr;
             }
-            else if (change)
-            {
-                var inflight = _snd_nxt - _snd_una;
-                _ssthresh = Math.Max(inflight / 2, IKCP_THRESH_MIN);
-                updatedCwnd = _ssthresh + resent;
-                incr = updatedCwnd * (uint)_mss;
-            }
-
-            if (updatedCwnd < 1)
-            {
-                updatedCwnd = 1;
-                incr = (uint)_mss;
-            }
-
-            var rmt_wnd = Volatile.Read(ref _rmt_wnd);
-            if (updatedCwnd > rmt_wnd) updatedCwnd = rmt_wnd;
-
-            _cwnd = updatedCwnd;
-            _incr = incr;
 
             // send keep-alive
             if (_keepAliveEnabled)
@@ -1334,8 +1346,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                 if (!HandleFlushException(ex)) break;
             }
 
-            if (_keepAliveEnabled && (uint)TimeDiff(current, Volatile.Read(ref _lastReceiveTick)) > _keepAliveGracePeriod)
-                SetTransportClosed();
+            if (_keepAliveEnabled)
+            {
+                current = GetTimestamp();
+                if ((uint)TimeDiff(current, Volatile.Read(ref _lastReceiveTick)) > _keepAliveGracePeriod)
+                    SetTransportClosed();
+            }
         }
     }
 
@@ -1381,6 +1397,12 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     {
         try
         {
+            if (TransportClosed)
+            {
+                bufferOwner?.Dispose();
+                return default;
+            }
+
             if (cancellationToken.IsCancellationRequested)
             {
                 bufferOwner?.Dispose();
@@ -1483,7 +1505,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
             prev_una = _snd_una;
         }
 
-        uint maxack = 0, latest_ts = 0;
+        uint maxack = 0;
         var flag = false;
         var mutated = false;
 
@@ -1548,21 +1570,19 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
                     {
                         flag = true;
                         maxack = header.SerialNumber;
-                        latest_ts = header.Timestamp;
                     }
                     else
                     {
                         if (TimeDiff(header.SerialNumber, maxack) > 0)
                         {
                             maxack = header.SerialNumber;
-                            latest_ts = header.Timestamp;
                         }
                     }
                 }
                 else if (header.Command == KcpCommand.WindowProbe)
                 {
-                    // Thread-safe update of _probe (assuming it's casted to int for Interlocked)
                     UpdateProbeThreadSafe(KcpProbeType.AskTell);
+                    mutated = true;
                 }
 
                 packet = packet.Slice(length);
@@ -1599,34 +1619,37 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
             if (TimeDiff(_snd_una, prev_una) > 0)
             {
-                var cwnd = _cwnd;
-                var incr = _incr;
-
-                var rmt_wnd = Volatile.Read(ref _rmt_wnd);
-                if (cwnd < rmt_wnd)
+                lock (_cwndLock)
                 {
-                    var mss = (uint)_mss;
-                    if (cwnd < _ssthresh)
+                    var cwnd = _cwnd;
+                    var incr = _incr;
+
+                    var rmt_wnd = Volatile.Read(ref _rmt_wnd);
+                    if (cwnd < rmt_wnd)
                     {
-                        cwnd++;
-                        incr += mss;
-                    }
-                    else
-                    {
-                        if (incr < mss) incr = mss;
-                        incr += (uint)mss * (uint)mss / Math.Max(1u, incr) + (uint)(mss / 16);
-                        cwnd = (incr + mss - 1) / (mss > 0 ? mss : 1);
+                        var mss = (uint)_mss;
+                        if (cwnd < _ssthresh)
+                        {
+                            cwnd++;
+                            incr += mss;
+                        }
+                        else
+                        {
+                            if (incr < mss) incr = mss;
+                            incr += (uint)mss * (uint)mss / Math.Max(1u, incr) + (uint)(mss / 16);
+                            cwnd = (incr + mss - 1) / (mss > 0 ? mss : 1);
+                        }
+
+                        if (cwnd > rmt_wnd)
+                        {
+                            cwnd = rmt_wnd;
+                            incr = rmt_wnd * mss;
+                        }
                     }
 
-                    if (cwnd > rmt_wnd)
-                    {
-                        cwnd = rmt_wnd;
-                        incr = rmt_wnd * mss;
-                    }
+                    _cwnd = cwnd;
+                    _incr = incr;
                 }
-
-                _cwnd = cwnd;
-                _incr = incr;
             }
 
             return mutated;
@@ -1639,6 +1662,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
     private void UpdateRtoThreadSafe(int rtt)
     {
+        KcpMetrics.RoundTripTime.Record((double)rtt, new System.Collections.Generic.KeyValuePair<string, object?>("conversation_id", _id));
         lock (_rtoLock)
         {
             UpdateRtoCore(rtt);
@@ -1800,34 +1824,37 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
             if (TimeDiff(_snd_una, prev_una) > 0)
             {
-                var cwnd = _cwnd;
-                var incr = _incr;
-
-                var rmt_wnd = Volatile.Read(ref _rmt_wnd);
-                if (cwnd < rmt_wnd)
+                lock (_cwndLock)
                 {
-                    var mss = (uint)_mss;
-                    if (cwnd < _ssthresh)
+                    var cwnd = _cwnd;
+                    var incr = _incr;
+
+                    var rmt_wnd = Volatile.Read(ref _rmt_wnd);
+                    if (cwnd < rmt_wnd)
                     {
-                        cwnd++;
-                        incr += mss;
-                    }
-                    else
-                    {
-                        if (incr < mss) incr = mss;
-                        incr += (uint)mss * (uint)mss / Math.Max(1u, incr) + (uint)(mss / 16);
-                        cwnd = (incr + mss - 1) / (mss > 0 ? mss : 1);
+                        var mss = (uint)_mss;
+                        if (cwnd < _ssthresh)
+                        {
+                            cwnd++;
+                            incr += mss;
+                        }
+                        else
+                        {
+                            if (incr < mss) incr = mss;
+                            incr += (uint)mss * (uint)mss / Math.Max(1u, incr) + (uint)(mss / 16);
+                            cwnd = (incr + mss - 1) / (mss > 0 ? mss : 1);
+                        }
+
+                        if (cwnd > rmt_wnd)
+                        {
+                            cwnd = rmt_wnd;
+                            incr = rmt_wnd * mss;
+                        }
                     }
 
-                    if (cwnd > rmt_wnd)
-                    {
-                        cwnd = rmt_wnd;
-                        incr = rmt_wnd * mss;
-                    }
+                    _cwnd = cwnd;
+                    _incr = incr;
                 }
-
-                _cwnd = cwnd;
-                _incr = incr;
             }
 
             return mutated;
@@ -1836,10 +1863,9 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
         {
             throw;
         }
-        finally
-        {
-            originalBuffer?.Dispose();
-        }
+        // Buffer ownership: the caller (KcpConversationUpdateNotification.Dispose) releases
+        // originalBuffer once. SetInput must not dispose it here — HandleData may Retain()
+        // into rcv_buf while the notification still holds the initial reference.
     }
 
     private bool HandleUnacknowledged(uint una)
@@ -1904,14 +1930,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     ///     Note: RTT values are validated by callers (e.g., <c>if (rtt >= 0)</c>) to prevent overflow issues
     ///     where RTT exceeds int.MaxValue ticks and wraps around to a negative number.
     /// </summary>
-    private void UpdateRto(int rtt)
-    {
-        KcpMetrics.RoundTripTime.Record(rtt, new System.Collections.Generic.KeyValuePair<string, object?>("conversation_id", _id));
-        lock (_rtoLock)
-        {
-            UpdateRtoCore(rtt);
-        }
-    }
+    private void UpdateRto(int rtt) => UpdateRtoThreadSafe(rtt);
 
     // Caller must hold _rtoLock
     private void UpdateRtoCore(int rtt)
@@ -1937,10 +1956,11 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
     private bool HandleAck(uint serialNumber, out int bytesFreed)
     {
         bytesFreed = 0;
-        if (TimeDiff(serialNumber, _snd_una) < 0 || TimeDiff(serialNumber, _snd_nxt) >= 0) return false;
 
         lock (_sndBufLock)
         {
+            if (TimeDiff(serialNumber, _snd_una) < 0 || TimeDiff(serialNumber, _snd_nxt) >= 0) return false;
+
             int index = (int)(serialNumber % (uint)_sndBufArray.Length);
             ref var item = ref _sndBufArray[index];
 
@@ -2290,6 +2310,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         WaitForUpdateLoopCompletion();
         DisposeCachedFlushBuffers();
+        DisposeOwnedTransport();
     }
 
     public async ValueTask DisposeAsync()
@@ -2302,6 +2323,15 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
         await WaitForUpdateLoopCompletionAsync().ConfigureAwait(false);
         DisposeCachedFlushBuffers();
+        DisposeOwnedTransport();
+    }
+
+    private void DisposeOwnedTransport()
+    {
+        if (_transport is KcpSocketTransportForConversation transport)
+        {
+            try { ((IDisposable)transport).Dispose(); } catch { }
+        }
     }
 
     private void WaitForUpdateLoopCompletion()
@@ -2333,6 +2363,7 @@ public sealed partial class KcpConversation : IKcpConversation, IKcpExceptionPro
 
     private void DisposeCachedFlushBuffers()
     {
+        _flushStateMachine = null;
         try { _cachedFlushBuffer.Dispose(); } catch { }
         try { _cachedAckFlushBuffer.Dispose(); } catch { }
     }

@@ -138,34 +138,46 @@ public sealed class KcpBuilder
             }
         }
 
-        KcpConversation conversation;
-
-        if (_socket != null)
+        Socket? socketToDisposeOnFailure = _socket;
+        try
         {
-            if (_localEndPoint != null && !_socket.IsBound)
+            KcpConversation conversation;
+
+            if (_socket != null)
             {
-                _socket.Bind(_localEndPoint);
+                if (_localEndPoint != null && !_socket.IsBound)
+                {
+                    _socket.Bind(_localEndPoint);
+                }
+                else if (_localEndPoint == null && !_socket.IsBound)
+                {
+                    _socket.Bind(new IPEndPoint(_socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0));
+                }
+                var transport = _conversationId.HasValue
+                    ? KcpSocketTransport.CreateConversation(_socket, _remoteEndPoint, _conversationId.Value, _options)
+                    : KcpSocketTransport.CreateConversation(_socket, _remoteEndPoint, _options);
+                ((IKcpTransport<KcpConversation>)transport).Start();
+                conversation = transport.Connection;
+                socketToDisposeOnFailure = null;
             }
-            else if (_localEndPoint == null && !_socket.IsBound)
+            else
             {
-                _socket.Bind(new IPEndPoint(_socket.AddressFamily == AddressFamily.InterNetworkV6 ? IPAddress.IPv6Any : IPAddress.Any, 0));
+                conversation = _conversationId.HasValue
+                    ? new KcpConversation(_remoteEndPoint, _transport!, _conversationId.Value, _options)
+                    : new KcpConversation(_remoteEndPoint, _transport!, _options);
             }
-            var transport = KcpSocketTransport.CreateConversation(_socket, _remoteEndPoint, _conversationId.GetValueOrDefault(), _options);
-            conversation = transport.Connection;
-            transport.Start();
-        }
-        else
-        {
-            conversation = _conversationId.HasValue
-                ? new KcpConversation(_remoteEndPoint, _transport!, _conversationId.Value, _options)
-                : new KcpConversation(_remoteEndPoint, _transport!, _options);
-        }
 
-        if (_exceptionHandler != null)
-        {
-            conversation.SetExceptionHandler(_exceptionHandler, _exceptionHandlerState);
-        }
+            if (_exceptionHandler != null)
+            {
+                conversation.SetExceptionHandler(_exceptionHandler, _exceptionHandlerState);
+            }
 
-        return conversation;
+            return conversation;
+        }
+        catch
+        {
+            try { socketToDisposeOnFailure?.Dispose(); } catch { }
+            throw;
+        }
     }
 }

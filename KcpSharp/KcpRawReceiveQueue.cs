@@ -224,6 +224,7 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
             if (_activeWait && !_signaled)
             {
                 ClearPreviousOperation();
+                ReleaseActiveWaitSlot();
                 exceptionToSet = ThrowHelper.NewOperationCanceledExceptionForCancelPendingReceive(innerException, cancellationToken);
                 executeSetException = true;
             }
@@ -248,6 +249,7 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
             {
                 var cancellationToken = _cancellationToken;
                 ClearPreviousOperation();
+                ReleaseActiveWaitSlot();
                 exceptionToSet = new OperationCanceledException(cancellationToken);
                 executeSetException = true;
             }
@@ -267,6 +269,16 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
         _cancellationToken = default;
     }
 
+    private void ReleaseActiveWaitSlot()
+    {
+        _activeWait = false;
+        // Unregister (non-blocking) instead of Dispose: this runs under _syncRoot, and Dispose would
+        // block waiting for a concurrently-firing SetCanceled callback that also needs _syncRoot -> deadlock.
+        // The _signaled flag already guarantees exactly-once completion.
+        _cancellationRegistration.Unregister();
+        _cancellationRegistration = default;
+    }
+
     internal void Enqueue(ReadOnlySpan<byte> buffer)
     {
         bool executeSetException = false;
@@ -278,7 +290,11 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
 
             if (_count > 0 || !_activeWait)
             {
-                if (_count >= _capacity) return;
+                if (_count >= _capacity)
+                {
+                    KcpMetrics.PacketsDropped.Add(1);
+                    return;
+                }
 
                 var owner = _bufferPool.Rent(new KcpBufferPoolRentOptions(buffer.Length, false));
                 _queue[_tail] = KcpBuffer.CreateFromSpan(owner, buffer);
@@ -341,6 +357,7 @@ internal sealed class KcpRawReceiveQueue : IValueTaskSource<KcpConversationRecei
             if (_activeWait && !_signaled)
             {
                 ClearPreviousOperation();
+                ReleaseActiveWaitSlot();
                 executeSetResult = true;
             }
 
